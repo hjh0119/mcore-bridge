@@ -25,6 +25,7 @@ class MLLMModelType:
     qwen3_omni = 'qwen3_omni'
     qwen3_asr = 'qwen3_asr'
     qwen3_5 = 'qwen3_5'
+    qwen3_8_flash_next = 'qwen3_8_flash_next'
     ovis2_5 = 'ovis2_5'
 
     internvl_chat = 'internvl_chat'

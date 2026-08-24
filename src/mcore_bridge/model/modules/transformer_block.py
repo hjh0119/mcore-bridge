@@ -358,11 +358,17 @@ class TransformerBlock(McoreTransformerBlock):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         enable_hyper_connections = getattr(self.config, 'enable_hyper_connections', False)
+        # Qwen3.8-Flash-Next style gated HC (GatedResidualSimple): n-stream
+        # hidden created by replicating the embedding (HC outer, HS inner).
+        hc_count = getattr(self.config, 'hc_count', 0) or 0
+        enable_gated_hc = hc_count > 1 and not enable_hyper_connections
         # Expand hidden states for hyper connections at the start of the block
         # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage
         if enable_hyper_connections and self.pre_process:
             hidden_states = HyperConnectionModule.input_expand(hidden_states,
                                                                self.num_residual_streams)  # [s, b, C] -> [s, b, n*C]
+        elif enable_gated_hc and self.pre_process:
+            hidden_states = hidden_states.repeat(1, 1, hc_count)  # [s, b, C] -> [s, b, n*C]
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -490,6 +496,10 @@ class TransformerBlock(McoreTransformerBlock):
                 self.config.num_residual_streams,
                 self.config.layernorm_epsilon,
             )
+        elif enable_gated_hc and self.has_final_layernorm_in_this_stage():
+            # Gated low-rank contraction (hyper_connection_mixer, mix-only).
+            # [s, b, n*C] -> [s, b, C]
+            hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
 
         # Final layer norm.
         if self.final_layernorm is not None:
