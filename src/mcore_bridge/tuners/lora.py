@@ -448,8 +448,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 # violates TE's FP8 GEMM divisibility rules; never run them
                 # under fp8 autocast (mirrors the in_proj_ba guard in
                 # gpts/qwen4_exp.py's GDN path).
-                fp8_context = (transformer_engine.pytorch.fp8_autocast(enabled=False)
-                               if getattr(self.config, 'fp8_param', False) else nullcontext())
+                fp8_context = (
+                    transformer_engine.pytorch.fp8_autocast(
+                        enabled=False) if getattr(self.config, 'fp8_param', False) else nullcontext())
                 with fp8_context:
                     lora_result = lora_A(dropout(x), *args, **kwargs) if isinstance(
                         lora_A, (TEGroupedLinear, NpuGroupedLoraLinear)) else lora_A(dropout(x))

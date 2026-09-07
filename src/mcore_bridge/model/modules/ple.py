@@ -197,9 +197,8 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         if self._NGRAM_SCALE_KEY in hf_state_dict:
             scale = hf_state_dict[self._NGRAM_SCALE_KEY].load().to(torch.float32)
         else:
-            get_logger().warning(
-                f'`{self._NGRAM_SCALE_KEY}` not found in the checkpoint; assuming the PLE ngram '
-                'embedding is already dequantized and loading it as-is.')
+            get_logger().warning(f'`{self._NGRAM_SCALE_KEY}` not found in the checkpoint; assuming the PLE ngram '
+                                 'embedding is already dequantized and loading it as-is.')
         self._ngram_weight_scale = scale
         for i in range(parts):
             key = f'ple.ple_embedding.ngram_embedding.shard_{i}.weight'
@@ -236,9 +235,8 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         # as fp8 + scale; keep the current dtype and warn.
         scale = getattr(self, '_ngram_weight_scale', None)
         if scale is None:
-            get_logger().warning(
-                f'`{self._NGRAM_SCALE_KEY}` was not seen during loading; exporting the PLE ngram '
-                'embedding without re-quantizing to fp8.')
+            get_logger().warning(f'`{self._NGRAM_SCALE_KEY}` was not seen during loading; exporting the PLE ngram '
+                                 'embedding without re-quantizing to fp8.')
         for i in range(parts):
             cs, ce = i * shard_size, min((i + 1) * shard_size, total)
             # Reduce on GPU: NCCL has no CPU backend, and the host table is pinned

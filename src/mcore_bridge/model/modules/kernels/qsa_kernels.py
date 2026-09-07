@@ -162,7 +162,7 @@ class QSASparseCoreAttention(torch.nn.Module):
     Any bool/None mask (or non-int tensor) falls through to the wrapped
     core_attention, keeping the no-op / short-sequence path on TE's fused kernel.
 
-    Context parallelism (``cp_comm_type=allgather``): q stays on the local CP
+    Context parallelism (``cp_comm_type=all_gather``): q stays on the local CP
     shard while k/v are gathered across the CP group and restored to logical
     order; indices (full-sequence) are sliced to this rank's query rows. The
     gather's backward reduce-scatters dk/dv to the local shards.

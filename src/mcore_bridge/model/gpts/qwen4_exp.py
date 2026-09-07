@@ -141,7 +141,7 @@ class Qwen4ExpLayer(TransformerLayer):
         Returns ``(selection, is_sparse)``. ``is_sparse`` means ``selection`` is the
         int64 index tensor consumed by ``QSASparseCoreAttention`` (sbhd and thd,
         with or without SP/CP); otherwise it is the bool TE mask from the legacy
-        path, or ``None`` for full attention. CP needs the allgather comm type
+        path, or ``None`` for full attention. CP needs the all_gather comm type
         (the selection has to see every key before attention runs; ring/p2p
         cannot provide that), mirroring mcore DSA's restriction.
         """
@@ -166,9 +166,9 @@ class Qwen4ExpLayer(TransformerLayer):
                                'but QSASparseCoreAttention was not installed -- triton is missing or '
                                f'kv_channels={getattr(self.config, "kv_channels", None)} is not a power of two. '
                                'Use --padding_free false with context_parallel_size 1 to take the bool-mask path.')
-        if cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'allgather':
+        if cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'all_gather':
             raise RuntimeError(f"QSA sparse selection with context_parallel_size={cp_size} requires "
-                               f"cp_comm_type='allgather' (got {getattr(self.config, 'cp_comm_type', None)!r}): the "
+                               f"cp_comm_type='all_gather' (got {getattr(self.config, 'cp_comm_type', None)!r}): the "
                                'selection has to see every key before attention runs, which ring/p2p cannot provide.')
         rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
         if rotary_pos_emb is None:
@@ -450,9 +450,23 @@ class Qwen4ExpLoader(ModelLoader):
         config.hetereogenous_dist_checkpoint = True
         # Context parallelism: PLE gathers the full sequence internally (undoing the
         # CP zigzag) and GDN carries its own CP handling (a2a CP<->HP plus CP-aware
-        # cu_seqlens), so CP is no longer blanket-rejected here. Left unasserted so
-        # it can be exercised; QSA layers run dense attention, which mcore's
-        # attention already supports under CP.
+        # cu_seqlens); QSA layers run the sparse kernel, whose selection and CP
+        # attention both need every key gathered before attention (see
+        # _qsa_select). That requires cp_comm_type='all_gather', the only comm type
+        # this path supports.
+        #
+        # swift leaves cp_comm_type unset (None), which mcore's arg parser then
+        # resolves to its own default 'p2p' before we see it -- so by the time this
+        # runs the "unset" case already looks like 'p2p'. Since ring/p2p simply
+        # cannot serve QSA sparse under CP, promote it (and any stray None) to
+        # 'all_gather' with a warning, so CP just works instead of raising in the
+        # layer. A user who explicitly wants a2a/a2a+p2p keeps it (the layer guard
+        # will then reject, telling them QSA needs all_gather).
+        if config.context_parallel_size > 1 and getattr(config, 'cp_comm_type', None) in (None, 'p2p'):
+            logger.warning_once(
+                "Qwen4-Exp QSA under context parallelism requires cp_comm_type='all_gather'; "
+                f"got {getattr(config, 'cp_comm_type', None)!r} (mcore's default), promoting to 'all_gather'.")
+            config.cp_comm_type = 'all_gather'
         if getattr(config, 'mtp_num_layers', None):
             raise NotImplementedError('Qwen4-Exp MTP is not supported yet')
         moe_spec = get_gpt_layer_with_transformer_engine_spec(
