@@ -61,10 +61,10 @@ class Qwen4ExpLayer(TransformerLayer):
         is_linear_attention = config.linear_attention_freq[self.layer_number - 1]
         if not is_linear_attention and config.indexer_n_heads is not None:
             self.self_attention.indexer = QSAIndexer(config, tp_group=self.tp_group)
-            if qsa_sparse_supported(config.kv_channels or 0):
+            if qsa_sparse_supported(config.kv_channels):
                 attn = self.self_attention
                 attn.core_attention = QSASparseCoreAttention(
-                    attn.core_attention, config, softmax_scale=getattr(config, 'softmax_scale', None))
+                    attn.core_attention, config, softmax_scale=config.softmax_scale)
         self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
         self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
 
@@ -249,7 +249,7 @@ class Qwen4ExpLayer(TransformerLayer):
         # Returning None means full attention, which here only happens when the
         # sequence is short enough that selection is a no-op anyway (selection_as_mask
         # short-circuits at max_blocks <= block_topk).
-        indexer = getattr(self.self_attention, 'indexer', None)
+        indexer = self.self_attention.indexer
         if indexer is None:
             return None
         rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
@@ -448,20 +448,6 @@ class Qwen4ExpLoader(ModelLoader):
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
         config = self.config
         config.hetereogenous_dist_checkpoint = True
-        # Context parallelism: PLE gathers the full sequence internally (undoing the
-        # CP zigzag) and GDN carries its own CP handling (a2a CP<->HP plus CP-aware
-        # cu_seqlens); QSA layers run the sparse kernel, whose selection and CP
-        # attention both need every key gathered before attention (see
-        # _qsa_select). That requires cp_comm_type='all_gather', the only comm type
-        # this path supports.
-        #
-        # swift leaves cp_comm_type unset (None), which mcore's arg parser then
-        # resolves to its own default 'p2p' before we see it -- so by the time this
-        # runs the "unset" case already looks like 'p2p'. Since ring/p2p simply
-        # cannot serve QSA sparse under CP, promote it (and any stray None) to
-        # 'all_gather' with a warning, so CP just works instead of raising in the
-        # layer. A user who explicitly wants a2a/a2a+p2p keeps it (the layer guard
-        # will then reject, telling them QSA needs all_gather).
         if config.context_parallel_size > 1 and getattr(config, 'cp_comm_type', None) in (None, 'p2p'):
             logger.warning_once(
                 "Qwen4-Exp QSA under context parallelism requires cp_comm_type='all_gather'; "
