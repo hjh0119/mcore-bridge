@@ -75,9 +75,10 @@ class QSAIndexer(nn.Module):
     mask's O(s^2), which is what makes very long sequences feasible.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, tp_group=None):
         super().__init__()
         self.config = config
+        self.tp_group = tp_group
         self.index_n_heads = config.indexer_n_heads
         self.index_kv_heads = config.indexer_kv_heads
         self.index_head_dim = config.indexer_head_dim
@@ -120,10 +121,12 @@ class QSAIndexer(nn.Module):
         Args:
             hidden_states: ``[s, b, h]`` (mcore layout), pre-attention input --
                 the same tensor the reference indexer consumes.
-            freqs: mcore rotary frequencies ``[s, 1, 1, rot_dim]``. mcore stores
-                angles rather than cos/sin, so they are materialized here the way
-                ``_patch_apply_rotary_pos_emb`` does (``cos(freqs) * mscale``),
-                keeping the indexer's RoPE identical to the attention's.
+            freqs: mcore rotary frequencies ``[s, freq_b, 1, rot_dim]``, where
+                ``freq_b`` is 1 for ordinary RoPE or ``b`` for batch-dependent
+                MRoPE. mcore stores angles rather than cos/sin, so they are
+                materialized here the way ``_patch_apply_rotary_pos_emb`` does
+                (``cos(freqs) * mscale``), keeping the indexer's RoPE identical
+                to the attention's.
 
         Returns:
             ``None`` when selection is a no-op (the causal prefix never exceeds

@@ -506,3 +506,51 @@ def test_indexer_mrope_batch():
         ok &= same
         print(f'    sample {i}: batched == standalone -> {"OK" if same else "FAIL"}')
     assert ok, 'per-sample selection changed when batched (mrope batch dim leaked into rot)'
+
+
+def test_indexer_is_parallelism_agnostic():
+    """The indexer must select on exactly the sequence it is handed.
+
+    By design the layer gathers SP / undoes CP *before* calling, so
+    ``_score_and_topk_blocks`` sizes everything from ``hidden_states.shape[0]``
+    and never rescales by ``tensor_model_parallel_size``. This pins that: with
+    ``sequence_parallel=True`` and ``tp>1`` set on the config, a length-``s``
+    input must give the identical result as the plain single-rank config -- if
+    the indexer secretly multiplied ``s`` by ``tp_size`` it would build
+    mask/index tensors at the wrong length (the bug an in-indexer gather would
+    reintroduce)."""
+    from mcore_bridge.model.modules.qsa_indexer import QSAIndexer
+    print('\n[10] QSAIndexer ignores SP/TP config: selects on the given sequence length')
+    ok = True
+    for s, ratio, budget, seed in [(200, 4, 64, 0), (201, 4, 64, 1), (128, 2, 32, 2)]:
+        # Baseline: no parallelism.
+        torch.manual_seed(seed)
+        base_cfg = _make_config(compress_ratio=ratio, budget=budget)
+        base = QSAIndexer(base_cfg).cuda()
+        with torch.no_grad():
+            base.index_qk_proj.weight.normal_(0, 0.02)
+            base.q_layernorm.weight.normal_(0, 0.02)
+            base.k_layernorm.weight.normal_(0, 0.02)
+
+        # Same weights, but a config that claims SP + TP=2. tp_group=None keeps
+        # the projection duplicated (no real collective), so results must match.
+        sp_cfg = _make_config(compress_ratio=ratio, budget=budget)
+        sp_cfg.sequence_parallel = True
+        sp_cfg.tensor_model_parallel_size = 2
+        sp = QSAIndexer(sp_cfg).cuda()
+        sp.load_state_dict(base.state_dict())
+
+        hs = torch.randn(s, 1, base_cfg.hidden_size, device='cuda')
+        freqs = torch.randn(s, 1, 1, base_cfg.indexer_head_dim, device='cuda')
+
+        got_base = base.selection_as_token_indices(hs, freqs)
+        got_sp = sp.selection_as_token_indices(hs, freqs)
+        if got_base is None:
+            good = got_sp is None
+        else:
+            # shape[1] (the query axis) must be s, not s * tp_size.
+            good = got_sp is not None and got_sp.shape[1] == s and torch.equal(got_base, got_sp)
+        print(f'    s={s:4d} ratio={ratio}: SP-config == baseline, query_len==s -> '
+              f"{'OK' if good else 'FAIL'}")
+        ok &= good
+    assert ok, 'indexer output changed under an SP/TP config; it must be parallelism-agnostic'

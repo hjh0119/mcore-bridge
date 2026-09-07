@@ -12,7 +12,7 @@ from torch import nn
 from typing import List, Optional
 
 from ...utils import get_env_args, get_logger
-from ...utils.megatron_utils import reconstruct_tensor_cp, split_cp_inputs
+from ...utils.megatron_utils import get_num_samples, reconstruct_tensor_cp, split_cp_inputs
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
 from .kernels import gather_ple_rows, ple_gate_conv_triton
 
@@ -167,6 +167,11 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
                 config=config,
             )
 
+    # The PLE ngram embedding table is stored in the checkpoint as F8_E4M3 shards
+    # plus a single scalar `weight_scale` (unlike experts, which use blockwise
+    # `weight_scale_inv`). The true values are `weight * scale`.
+    _NGRAM_SCALE_KEY = 'ple.ple_embedding.ngram_embedding.weight_scale'
+
     def fill_table_from_hf(self, hf_state_dict):
         """Populate the (local TP partition of the) n-gram table from the HF
         checkpoint shards at load time.
@@ -184,6 +189,18 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
             tp_start = tp_rank * per_partition
             tp_end = min((tp_rank + 1) * per_partition, total)
             dtype = emb.weight.dtype
+        # The fp8 shards must be multiplied by the scalar `weight_scale` before
+        # being written into the bf16 table. Checkpoints that store the table in
+        # bf16 directly have no such key; keep the raw values then (with a
+        # warning). Stashed so export_table_to_hf can re-quantize with it.
+        scale = None
+        if self._NGRAM_SCALE_KEY in hf_state_dict:
+            scale = hf_state_dict[self._NGRAM_SCALE_KEY].load().to(torch.float32)
+        else:
+            get_logger().warning(
+                f'`{self._NGRAM_SCALE_KEY}` not found in the checkpoint; assuming the PLE ngram '
+                'embedding is already dequantized and loading it as-is.')
+        self._ngram_weight_scale = scale
         for i in range(parts):
             key = f'ple.ple_embedding.ngram_embedding.shard_{i}.weight'
             if key not in hf_state_dict:
@@ -193,6 +210,8 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
             if s >= e:
                 continue
             weight = hf_state_dict[key].load()
+            if scale is not None:
+                weight = weight.to(torch.float32) * scale
             if self.cpu_offload:
                 self.host_table[s - tp_start:e - tp_start] = weight[s - cs:e - cs].to(
                     dtype=dtype, device=self.host_table.device)
@@ -211,6 +230,15 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         shard_size = (total + parts - 1) // parts
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         tp_group = parallel_state.get_tensor_model_parallel_group()
+        # Inverse of fill_table_from_hf: the checkpoint format is fp8 shards +
+        # scalar `weight_scale`, so divide by the scale stashed during loading and
+        # cast back to fp8. Without a known scale the values cannot be represented
+        # as fp8 + scale; keep the current dtype and warn.
+        scale = getattr(self, '_ngram_weight_scale', None)
+        if scale is None:
+            get_logger().warning(
+                f'`{self._NGRAM_SCALE_KEY}` was not seen during loading; exporting the PLE ngram '
+                'embedding without re-quantizing to fp8.')
         for i in range(parts):
             cs, ce = i * shard_size, min((i + 1) * shard_size, total)
             # Reduce on GPU: NCCL has no CPU backend, and the host table is pinned
@@ -224,7 +252,15 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
             if self._tp_size > 1:
                 torch.distributed.all_reduce(local, group=tp_group)
             if tp_rank == 0:
+                # Re-quantize after the all_reduce: fp8 is not a valid accumulation
+                # dtype for NCCL, and the sum must happen in the loaded dtype.
+                if scale is not None:
+                    local = (local.to(torch.float32) / scale.to(local.device)).to(torch.float8_e4m3fn)
                 hf_state_dict[f'{prefix}ple.ple_embedding.ngram_embedding.shard_{i}.weight'] = local.cpu()
+        if tp_rank == 0 and scale is not None:
+            key = f'{prefix}{self._NGRAM_SCALE_KEY}'
+            if key not in hf_state_dict:
+                hf_state_dict[key] = scale.reshape(())
 
     def _shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
         # Mirrors transformers `_shift_right_ignore_eos`: segment-aware shift,
@@ -551,8 +587,12 @@ class Qwen4ExpTextPLELayer(nn.Module):
         """hidden_states: [s, b, nH] (bsh) or thd [T, 1, nH]; input_ids: [b, s] or [1, T]."""
         thd = packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', 'bshd') == 'thd'
         if thd:
-            num_samples = packed_seq_params.num_samples
-            max_len = int(packed_seq_params.max_seqlen_q)
+            num_samples = get_num_samples(packed_seq_params)
+            # PackedSeqParams.max_seqlen_q is declared `int` in mcore and swift
+            # normalizes it to int, so `.item()` would raise AttributeError;
+            # tolerate a 0-d tensor from other callers.
+            max_seqlen_q = packed_seq_params.max_seqlen_q
+            max_len = int(max_seqlen_q.item() if torch.is_tensor(max_seqlen_q) else max_seqlen_q)
             cu = packed_seq_params.cu_seqlens_q
             total = hidden_states.shape[0]
             hid = hidden_states.new_zeros((num_samples, max_len, hidden_states.shape[-1]))

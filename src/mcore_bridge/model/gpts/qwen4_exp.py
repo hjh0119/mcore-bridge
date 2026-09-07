@@ -60,7 +60,7 @@ class Qwen4ExpLayer(TransformerLayer):
                 config, config.ple_layer_ids.index(self.layer_number), pg_collection=self.pg_collection)
         is_linear_attention = config.linear_attention_freq[self.layer_number - 1]
         if not is_linear_attention and config.indexer_n_heads is not None:
-            self.self_attention.indexer = QSAIndexer(config)
+            self.self_attention.indexer = QSAIndexer(config, tp_group=self.tp_group)
             if qsa_sparse_supported(config.kv_channels or 0):
                 attn = self.self_attention
                 attn.core_attention = QSASparseCoreAttention(
