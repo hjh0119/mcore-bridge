@@ -212,8 +212,9 @@ class Qwen4ExpLayer(TransformerLayer):
         # arrives and must be indexed by the (CP-reconstructed) per-doc ids.
         freqs = rotary_pos_emb
         if self.config.context_parallel_size > 1:
-            fused_table = (self.config.position_embedding_type != 'mrope'
-                           and (self.config.apply_rope_fusion or freqs.shape[0] != local_len))
+            fused_table = (
+                self.config.position_embedding_type != 'mrope'
+                and (self.config.apply_rope_fusion or freqs.shape[0] != local_len))
             if fused_table:
                 if position_ids is None:
                     raise RuntimeError('QSA thd selection under CP needs position_ids to index the fused rotary '
@@ -239,7 +240,8 @@ class Qwen4ExpLayer(TransformerLayer):
                                'boundaries, but it is missing.')
         cu = Qwen4ExpTextPLELayer._normalize_cu_seqlens(cu, hidden_states.shape[0])
         hidden_tok = hidden_states.reshape(hidden_states.shape[0], -1)
-        return self.self_attention.indexer.select_token_indices_thd(hidden_tok, freqs, cu)
+        return self.self_attention.indexer.select_token_indices_thd(
+            hidden_tok, freqs, cu, force_materialize=self.config.context_parallel_size > 1)
 
     def _qsa_select_mask(self, hidden_states, attn_kwargs):
         # Bool-mask QSA on TE's `arbitrary` mask. Only reached for sbhd with CP==1 --
