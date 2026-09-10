@@ -32,11 +32,6 @@ from .qsa_block_sparse_attn import qsa_sparse_attention_from_indices
 
 logger = get_logger()
 
-# On by default; QSA_SPARSE_KERNEL=0 disables the vendored QSA sparse Triton kernel.
-# Where the kernel is mandatory (thd/padding_free or CP>1) QSA then falls back to full
-# attention; where the bool-mask path is available (sbhd, CP==1) it is used instead.
-# Intended as an escape hatch for backend-specific triton compile failures
-# (e.g. triton-ascend, #188).
 QSA_SPARSE_KERNEL_ENV = 'QSA_SPARSE_KERNEL'
 
 try:
@@ -62,9 +57,6 @@ def qsa_sparse_supported(head_dim: int) -> bool:
     if not HAVE_TRITON or head_dim <= 0 or (head_dim & (head_dim - 1)):
         return False
     if not torch.cuda.is_available():
-        # The vendored kernel is only tested on NVIDIA GPUs; on other triton backends
-        # (e.g. triton-ascend) compilation can fail (#188). The kernel stays installed
-        # by default -- this warning only tells users where the escape hatch is.
         logger.warning_once('The QSA sparse kernel is only tested on CUDA GPUs and may fail to compile on '
                             'this device. If you hit triton compile errors, set '
                             f'{QSA_SPARSE_KERNEL_ENV}=0 to disable it (QSA then falls back to full '
