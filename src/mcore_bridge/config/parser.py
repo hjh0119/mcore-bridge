@@ -122,6 +122,7 @@ config_mapping = {
     'mamba_num_groups': ['n_groups', 'mamba_num_groups'],
     'hybrid_layer_pattern': ['hybrid_override_pattern'],
     'fp32_residual_connection': ['residual_in_fp32'],
+    'moe_latent_size': ['moe_latent_size'],
     'mtp_hybrid_override_pattern': ['mtp_hybrid_override_pattern'],
     # other
     'original_max_position_embeddings': ['original_max_position_embeddings'],
@@ -195,6 +196,8 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
     res['hf_config'] = hf_config
     hf_model_type = res.get('hf_model_type')
     llm_model_type = res.get('llm_model_type') or hf_model_type
+    if hf_model_type == 'nemotron_h_omni':
+        llm_model_type = 'nemotron_h'
     res['llm_model_type'] = llm_model_type
 
     first_k_dense_replace = res.pop('first_k_dense_replace', None)

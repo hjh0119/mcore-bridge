@@ -450,7 +450,11 @@ class GPTBridge:
             dist.all_reduce(src_rank, group=pp_group)
             src_rank = dist.get_global_rank(pp_group, src_rank.item())
             meta_data = torch.zeros(10, dtype=torch.int64, device='cuda')
-            dtype_mapping = [torch.float64, torch.float32, torch.float16, torch.bfloat16, torch.uint8, torch.int32]
+            # Append NCCL-supported buffer dtypes without renumbering existing metadata.
+            dtype_mapping = [
+                torch.float64, torch.float32, torch.float16, torch.bfloat16, torch.uint8, torch.int32, torch.int64,
+                torch.bool, torch.int8
+            ]
             dtype_mapping_r = {v: k for k, v in enumerate(dtype_mapping)}
             if tensor is None:
                 dist.broadcast(meta_data, src=src_rank, group=pp_group)

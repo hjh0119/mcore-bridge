@@ -47,6 +47,7 @@ class MLLMModelType:
     muse_glimmer = 'muse_glimmer'
 
     deepseek_v41 = 'deepseek_v41'
+    nemotron_h_omni = 'nemotron_h_omni'
 
 
 class ModelType(LLMModelType, MLLMModelType):

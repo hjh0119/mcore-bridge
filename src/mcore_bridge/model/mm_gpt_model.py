@@ -102,7 +102,7 @@ class MultimodalGPTModel(MegatronModule):
         **kwargs,
     ) -> torch.Tensor:
         inference_context = kwargs.pop('inference_context', None)
-        extra_kwargs = {k: kwargs[k] for k in self.language_model.extra_forward_keys}
+        extra_kwargs = {k: kwargs[k] for k in self.language_model.extra_forward_keys if k in kwargs}
         # Compatible with legacy mcore-bridge behavior.
         cp_size = self.config.context_parallel_size
         cp_partition_mode = getattr(self.config, 'cp_partition_mode', 'zigzag')
