@@ -311,9 +311,19 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         if (self.tp_size > 1 and not isinstance(self.base_layer, TopKRouter)
                 and (getattr(self.config, 'sequence_parallel', False) or self.sequence_parallel)):
             replicated_factors = (lora_a, lora_b) if replicated_base else (lora_b if self.is_parallel_a else lora_a, )
+            # A base whose own weight is already complete on every rank (the AVG path in
+            # finalize_model_grads) computes on the gathered full sequence -- e.g. PLE's
+            # projections -- so the replicated factors' grads are complete too: average them
+            # across TP instead of the SP sum, which would amplify them by tp_size (#233).
+            complete_grads = replicated_base and getattr(
+                getattr(self.base_layer, 'weight', None), 'average_gradients_across_tp_domain', False)
             for factor in replicated_factors:
                 for p in factor.parameters():
-                    p.sequence_parallel = True
+                    if complete_grads:
+                        p.sequence_parallel = False
+                        p.average_gradients_across_tp_domain = True
+                    else:
+                        p.sequence_parallel = True
         self.lora_A[adapter_name] = lora_a
         self.lora_B[adapter_name] = lora_b
         if hasattr(self, 'lora_bias'):
