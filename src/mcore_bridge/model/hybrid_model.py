@@ -61,6 +61,12 @@ class HybridModel(McoreHybridModel):
         pattern = config.hybrid_layer_pattern
         mtp_pattern = getattr(config, 'mtp_hybrid_override_pattern', None)
         mtp_num_layers = config.mtp_num_layers
+        # Pattern entries describe PHYSICAL MTP layers: in repeated
+        # (shared-weight) mode the logical depth collapses to one physical
+        # layer, matching the pre-migration config where shared mode rewrote
+        # mtp_num_layers to 1.
+        if mtp_num_layers and getattr(config, 'mtp_use_repeated_layer', False):
+            mtp_num_layers = 1
         if (pattern and mtp_pattern and mtp_num_layers and '/' not in pattern):
             pattern = pattern + '/' + '/'.join([mtp_pattern] * mtp_num_layers)
         return pattern

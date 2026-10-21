@@ -26,10 +26,11 @@ from typing import List, Optional
 from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
 from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 
-from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, MultiTokenPredictionLayer, QSAIndexer,
+from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, QSAIndexer,
                        QSASparseCoreAttention, Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock,
                        TransformerLayer, qsa_sparse_supported, use_qsa_sparse_kernel)
 from ..modules.ple import Qwen4ExpTextNGramEmbedding
+from ..mtp import MultiTokenPredictionLayer
 from ..register import ModelLoader
 from .qwen3_next import Qwen3NextBridge, Qwen3NextRMSNorm, Qwen3NextSelfAttention
 

@@ -1931,8 +1931,14 @@ class GPTBridge:
             if to_mcore and self.pp_rank > 0:
                 self._set_state_dict(lm_model, 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key,
                                      to_mcore)
+            from mcore_bridge.model.mtp import get_physical_mtp_count
+            if not to_mcore:
+                phys_count = self._reduce_mtp_physical_count(lm_model)
+            else:
+                # Import: only the owning (last) stage reaches here.
+                phys_count = get_physical_mtp_count(lm_model)
             layer_idx = 0
-            while layer_idx < self.config.mtp_num_layers:
+            while layer_idx < phys_count:
                 res = self._convert_mtp_layer(lm_model, hf_state_dict, f'{self.hf_mtp_prefix}.', layer_idx, to_mcore)
                 layer_idx += 1
                 if to_mcore:
@@ -1968,7 +1974,19 @@ class GPTBridge:
         self._set_state_dict(mtp_layer, 'final_layernorm.weight', hf_state_dict, self.hf_mtp_final_layernorm_key,
                              to_mcore)
 
+    def _reduce_mtp_physical_count(self, lm_model) -> int:
+        """PP export: obtain the physical MTP layer count from the owning stage
+        so every rank iterates the same number of times (collective safety)."""
+        from mcore_bridge.model.mtp import get_physical_mtp_count
+        local = get_physical_mtp_count(lm_model)
+        if self.pp_size <= 1:
+            return local
+        t = torch.tensor([local], dtype=torch.long, device='cuda')
+        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=self.pp_group)
+        return int(t.item())
+
     def _convert_mtp_layer(self, lm_model, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):
+        from mcore_bridge.model.mtp import get_mtp_inner_layer
         mtp_layer = lm_model.mtp.layers[layer_idx] if hasattr(lm_model, 'mtp') else None
         if self.hf_mtp_prefix == self.hf_layers_prefix:
             hf_layer_idx = layer_idx + self.config.num_layers
@@ -1981,8 +1999,14 @@ class GPTBridge:
             if len(hf_state_dict) == 0:
                 if self._peft_format:
                     return {}
-                logger.info(f'MTP Layer {mtp_layer.layer_number} safetensors weights not found, '
-                            'this part will be randomly initialized.')
+                expected = f'{hf_prefix}*'
+                if not self.config.mtp_allow_random_init:
+                    raise ValueError(
+                        f'MTP weights not found under {expected} (expected '
+                        f'{self.config.mtp_num_layers} physical set(s) after the {self.config.num_layers} '
+                        'decoder layers). Set mtp_allow_random_init=True to train MTP from random init.')
+                logger.warning(f'MTP Layer {mtp_layer.layer_number} weights not found under {expected}; '
+                               'randomly initializing (mtp_allow_random_init=True).')
                 for param in mtp_layer.parameters():
                     if param.ndim == 2:
                         mtp_layer.config.init_method(param.data)
@@ -1991,7 +2015,7 @@ class GPTBridge:
             origin_hf_state_dict = {}
             hf_state_dict = {}
         self._convert_mtp_extra(mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict)
-        transformer_layer = None if mtp_layer is None else mtp_layer.transformer_layer
+        transformer_layer = None if mtp_layer is None else get_mtp_inner_layer(mtp_layer)
         self._convert_mtp_embeds(lm_model, hf_state_dict, to_mcore)
         hf_state_dict.update(self._set_layer_attn(transformer_layer, hf_state_dict, -1, to_mcore))
         hf_state_dict.update(self._set_layer_mlp(transformer_layer, hf_state_dict, -1, to_mcore, is_mtp=True))

@@ -18,22 +18,22 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import (copy_to_tensor_model_parallel_region,
                                                     gather_from_sequence_parallel_region,
                                                     reduce_from_tensor_model_parallel_region)
-from megatron.core.transformer.multi_token_prediction import (MTPLossAutoScaler, MTPLossLoggingHelper,
-                                                              tie_word_embeddings_state_dict)
+from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 from packaging import version
 from typing import Optional, Tuple
 
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import get_logger, roll_tensor, split_cp_inputs
+from mcore_bridge.utils import get_logger, split_cp_inputs
 
+from .mtp import prepare_mtp_loss_mask, process_mtp_loss_compat
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()
 
-mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
-mcore_019 = version.parse(megatron.core.__version__) >= version.parse('0.19.0rc0')
+mcore_ge_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
+mcore_ge_019 = version.parse(megatron.core.__version__) >= version.parse('0.19.0rc0')
 
 
 class OutputLayerLinear(TELinear):
@@ -53,6 +53,37 @@ class OutputLayerLinear(TELinear):
                 if v.data is not None and v.data.numel() == 0:
                     v.data = None
         return res
+
+
+class _MtpOutputLayerProxy:
+    """Output-layer callable handed to ``process_mtp_loss``.
+
+    Applies the model's own logits transform (``_forward_output_layer``:
+    Gemma4 softcap, MuseGlimmer output_multiplier, ...) to the MTP logits so
+    the MTP loss and the main loss share one contract, while exposing the
+    REAL output layer's attributes -- upstream reads ``output_layer.weight``
+    in the ``mtp_detach_heads`` branch (untied weights) and in acceptance
+    counting, which a bare function wrapper would crash on.
+    """
+
+    def __init__(self, model: 'GPTModel'):
+        self._model = model
+
+    def __call__(self, hidden_states, *args, **kwargs):
+        model = self._model
+        if kwargs.get('output_cross_entropy_loss'):
+            # dev fused linear-CE path: no logits are materialized, so a
+            # subclass transform cannot be applied.  Fail loud rather than
+            # silently train an untransformed MTP loss.
+            if type(model)._forward_output_layer is not GPTModel._forward_output_layer:
+                raise NotImplementedError('fused linear cross-entropy MTP loss cannot apply a model-specific '
+                                          'logits transform (_forward_output_layer override); disable '
+                                          'cross_entropy_loss_fusion or remove the override')
+            return model.output_layer(hidden_states, *args, **kwargs)
+        return model._forward_output_layer(hidden_states, *args, **kwargs), None
+
+    def __getattr__(self, name):
+        return getattr(self._model.output_layer, name)
 
 
 class GPTModel(McoreGPTModel):
@@ -122,18 +153,6 @@ class GPTModel(McoreGPTModel):
             config.apply_rope_fusion = False
             logger.warning(f'`apply_rope_fusion` does not support `attention_scaling`. '
                            f'Setting `config.apply_rope_fusion`: {config.apply_rope_fusion}')
-        if getattr(self, 'mtp', None) is not None:
-            for layer in self.mtp.layers:
-                # compat megatron-core main branch
-                if not hasattr(layer, 'transformer_layer'):
-
-                    def _value(self):
-                        return getattr(self, 'mtp_model_layer')
-
-                    setattr(layer.__class__, 'transformer_layer', property(_value))
-                attention = layer.transformer_layer.self_attention
-                attention.config = copy.copy(attention.config)
-                attention.config.apply_rope_fusion = False
 
     def _init_mla_softmax_scale(self, config):
         if self.hf_rope_scaling and self.hf_rope_scaling['rope_type'] == 'yarn':
@@ -304,7 +323,7 @@ class GPTModel(McoreGPTModel):
         full_attention_mask = attention_mask
         if isinstance(full_attention_mask, dict):
             full_attention_mask = full_attention_mask['full_attention']
-        if mcore_016 and full_attention_mask is not None:
+        if mcore_ge_016 and full_attention_mask is not None:
             assert packed_seq_params is None
             padding_mask = full_attention_mask.all(dim=(1, 2))
             if self.config.context_parallel_size > 1:
@@ -479,6 +498,12 @@ class GPTModel(McoreGPTModel):
             output_weight = self.shared_embedding_or_output_weight()
 
         if self.mtp_process and labels is not None:
+            # Extract bridge-specific params from extra_block_kwargs before
+            # forwarding to the MTP block.
+            ebk = dict(extra_block_kwargs or {})
+            mhc_multistream = ebk.pop('mhc_multistream', None)
+            padding_mask = ebk.pop('padding_mask', None)
+
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -492,73 +517,33 @@ class GPTModel(McoreGPTModel):
                 sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,
                 decoder_input=decoder_input if self.config.is_multimodal else None,
-                **(extra_block_kwargs or {}),
+                padding_mask=padding_mask,
+                mhc_multistream=mhc_multistream,
+                **ebk,
             )
-            mtp_labels = labels.clone()
-            hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_unroll_steps, dim=0)
-            hidden_states = hidden_states_list[0]
-            if loss_mask is None:
-                # if loss_mask is not provided, use all ones as loss_mask
-                loss_mask = torch.ones_like(mtp_labels)
-            # Capture pre-roll token count so calculate_per_token_loss=True can
-            # re-normalize MTP gradients against the main-loss token count.
-            original_num_tokens = (loss_mask & (mtp_labels != -100)).sum()
-            for mtp_layer_number in range(self.config.mtp_unroll_steps):
-                # output
-                mtp_logits = self._forward_output_layer(
-                    hidden_states_list[mtp_layer_number + 1],
-                    weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
-                )
-                # Calc loss for the current Multi-Token Prediction (MTP) layers.
-                mtp_labels, _ = roll_tensor(
-                    mtp_labels,
-                    shifts=-1,
-                    dims=-1,
-                    cp_group=self.cp_group,
-                    packed_seq_params=packed_seq_params,
-                )
-                loss_mask, _ = roll_tensor(
-                    loss_mask,
-                    shifts=-1,
-                    dims=-1,
-                    cp_group=self.cp_group,
-                    packed_seq_params=packed_seq_params,
-                )
-                mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
-                loss_mask_ = (loss_mask & (mtp_labels != -100))
-                num_tokens = loss_mask_.sum()
-                mtp_loss = loss_mask_ * mtp_loss
-                if self.training:
-                    mtp_loss_for_log = (
-                        torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0))
-                    avg_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-                    if hasattr(MTPLossLoggingHelper, 'save_metrics_to_tracker'):
-                        # mcore >= 0.19 main branch: save_metrics_to_tracker with correct/total
-                        from megatron.core.transformer.multi_token_prediction import _compute_mtp_acceptance_counts
-                        correct, total = _compute_mtp_acceptance_counts(
-                            mtp_logits, mtp_labels, loss_mask_, output_layer=None, runtime_gather_output=True)
-                        MTPLossLoggingHelper.save_metrics_to_tracker(
-                            mtp_loss_for_log,
-                            correct,
-                            total,
-                            mtp_layer_number,
-                            self.config.mtp_unroll_steps,
-                            avg_group=avg_group)
-                    else:
-                        # mcore < 0.19: original signature
-                        MTPLossLoggingHelper.save_loss_to_tracker(
-                            mtp_loss_for_log, mtp_layer_number, self.config.mtp_unroll_steps, avg_group=avg_group)
-                mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_unroll_steps
-                # Clamp to avoid 0/0=NaN when a CP rank's tokens are all rolled out of range.
-                safe_num_tokens = num_tokens.clamp(min=1)
-                if self.config.calculate_per_token_loss:
-                    # finalize_model_grads divides all grads by main-loss total_num_tokens;
-                    # MTP has fewer valid tokens after rolling, so rescale by original_num_tokens.
-                    hidden_states = MTPLossAutoScaler.apply(
-                        hidden_states, mtp_loss_scale * mtp_loss * (original_num_tokens / safe_num_tokens))
-                else:
-                    hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens)
+
+            # Merge -100 labels into loss_mask so upstream process_mtp_loss
+            # sees a clean mask (bridge historically filtered inside its loop).
+            mtp_loss_mask = prepare_mtp_loss_mask(labels, loss_mask)
+
+            hidden_states = process_mtp_loss_compat(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=mtp_loss_mask,
+                output_layer=_MtpOutputLayerProxy(self),
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                is_training=self.training,
+                compute_language_model_loss=self.compute_language_model_loss,
+                config=self.config,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+                # Forwarded only when the installed process_mtp_loss accepts
+                # them (0.19+/dev); dev requires tp_group to compute MTP
+                # acceptance counts from vocab-sharded logits under TP>1.
+                tp_group=self.pg_collection.tp,
+                input_ids=input_ids,
+            )
         sequence_parallel_override = False
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
@@ -635,7 +620,7 @@ class GPTModel(McoreGPTModel):
             return super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         assert not sharded_offsets, 'Unexpected sharded offsets'
-        if mcore_016:
+        if mcore_ge_016:
             from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
             metadata = ensure_metadata_has_dp_cp_group(metadata)
             kwargs = {'tp_group': self.tp_group, 'dp_cp_group': metadata['dp_cp_group']}

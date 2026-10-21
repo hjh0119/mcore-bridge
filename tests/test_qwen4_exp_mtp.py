@@ -287,7 +287,7 @@ def test_qwen4exp_mtp_forward_backward_flows_grads_to_head():
 
 
 def test_mtp_inner_layer_kwargs_are_model_opt_in():
-    from mcore_bridge.model.modules.mtp_layer import MultiTokenPredictionLayer
+    from mcore_bridge.model.mtp import MultiTokenPredictionLayer
     layer = object.__new__(MultiTokenPredictionLayer)
     assert layer._get_inner_layer_kwargs(None, None) == {}
 
@@ -299,7 +299,7 @@ def test_qwen4exp_shared_mtp_recompute_restores_each_depth_ids(monkeypatch):
     with _parallel_context():
         model, config = _build(mtp=2, recompute=True, shared=True)
         lm = _lm(model).train()
-        assert config.mtp_num_layers == 1 and config.mtp_unroll_steps == 2
+        assert config.mtp_num_layers == 2 and config.mtp_unroll_steps == 2
         assert len(lm.mtp.layers) == 1
 
         calls = []
@@ -307,7 +307,10 @@ def test_qwen4exp_shared_mtp_recompute_restores_each_depth_ids(monkeypatch):
         original = layer._proj_and_transformer_layer
 
         def record_ids(*args, **kwargs):
-            calls.append((kwargs['input_ids'].detach().clone(), kwargs['position_ids'].detach().clone()))
+            # MultiTokenPredictionLayer routes model-specific per-depth inputs through the staged
+            # extras channel, so read them from _pending_extras at the inner-layer entry.
+            extras = layer._pending_extras or {}
+            calls.append((extras['input_ids'].detach().clone(), extras['position_ids'].detach().clone()))
             return original(*args, **kwargs)
 
         layer._proj_and_transformer_layer = record_ids

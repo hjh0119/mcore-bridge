@@ -16,7 +16,7 @@ from typing import Optional
 
 from .logger import get_logger
 
-mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
+mcore_ge_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
 
 # Megatron dev (0.19+) refactored `roll_tensor` to take a LIST of tensors and return a list of rolled
 # tensors; 0.16/0.18 take a single tensor and return `(rolled, rolled.sum())`. mcore-bridge's callers
@@ -306,8 +306,8 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
 
 
 def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
-    if mcore_016 or packed_seq_params is None:
-        kwargs = {'packed_seq_params': packed_seq_params} if mcore_016 else {}
+    if mcore_ge_016 or packed_seq_params is None:
+        kwargs = {'packed_seq_params': packed_seq_params} if mcore_ge_016 else {}
         if _ROLL_TAKES_LIST:
             rolled = mcore_roll_tensor([tensor], shifts=shifts, dims=dims, cp_group=cp_group, **kwargs)[0]
             return rolled, rolled.sum()

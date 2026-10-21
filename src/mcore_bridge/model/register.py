@@ -20,8 +20,9 @@ from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger
 
-from .modules import (AbsorbedMLASelfAttention, DSAIndexer, MLASelfAttention, MultiTokenPredictionLayer, TopKRouter,
-                      TransformerBlock, TransformerLayer)
+from .modules import (AbsorbedMLASelfAttention, DSAIndexer, MLASelfAttention, TopKRouter, TransformerBlock,
+                      TransformerLayer)
+from .mtp import adapt_mtp_block_spec, get_mtp_block_cls
 
 if TYPE_CHECKING:
     from .gpt_model import GPTModel
@@ -139,14 +140,11 @@ class ModelLoader:
     def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
         mtp_block_spec = get_gpt_mtp_block_spec(
             self.config, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
-        if mtp_block_spec is not None:
-            for layer_spec in mtp_block_spec.layer_specs:
-                layer_spec.module = MultiTokenPredictionLayer
-        return mtp_block_spec
+        return adapt_mtp_block_spec(self.config, mtp_block_spec)
 
     def _set_shared_expert_gate(self, transformer_layer_spec):
-        mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
-        if (not mcore_016 and self.config.moe_shared_expert_gate and self.config.num_moe_experts
+        mcore_ge_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
+        if (not mcore_ge_016 and self.config.moe_shared_expert_gate and self.config.num_moe_experts
                 and self.config.moe_shared_expert_intermediate_size):
             for layer_spec in transformer_layer_spec.layer_specs:
                 if hasattr(layer_spec.submodules.mlp.submodules, 'shared_experts'):
@@ -196,7 +194,7 @@ class ModelLoader:
         mtp_block_spec = None
         if self.config.mtp_num_layers is not None:
             mtp_block_spec = self.get_mtp_block_spec(transformer_layer_spec, vp_stage=vp_stage)
-        with self._patch_transformer_block():
+        with self._patch_transformer_block(), self._patch_mtp_block():
             model = self.model_cls(
                 config=self.config,
                 transformer_layer_spec=transformer_layer_spec,
@@ -216,6 +214,23 @@ class ModelLoader:
             yield
         finally:
             gpt_model.TransformerBlock = TransformerBlock
+
+    @contextmanager
+    def _patch_mtp_block(self):
+        """Temporarily replace the MTP block class used by upstream GPTModel
+        so that :class:`MultiTokenPredictionBlock` is instantiated instead."""
+        if self.config.mtp_num_layers is None:
+            yield
+            return
+        original = getattr(gpt_model, 'MultiTokenPredictionBlock', None)
+        if original is None:
+            yield
+            return
+        gpt_model.MultiTokenPredictionBlock = get_mtp_block_cls(self.config)
+        try:
+            yield
+        finally:
+            gpt_model.MultiTokenPredictionBlock = original
 
     def _set_linear_is_expert(self, model):
         for n, module in model.named_modules():

@@ -283,6 +283,9 @@ class ModelConfig(TransformerConfig):
 
     # mtp
     mtp_decoder_input_detach: bool = False
+    # Allow a full-finetune checkpoint that carries no MTP weights to random-init them.
+    # Off by default: a missing MTP key set is usually a wrong path/name, not intent.
+    mtp_allow_random_init: bool = False
     mtp_shared_weights: bool = False
 
     # visual
@@ -395,12 +398,39 @@ class ModelConfig(TransformerConfig):
             self.apply_query_key_layer_scaling = self.fp16
         if self.apply_query_key_layer_scaling:
             os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
+        # mtp_num_layers is always the *logical* prediction depth.
+        # mtp_shared_weights is a deprecated alias for mtp_use_repeated_layer.
         if self.mtp_shared_weights:
-            assert self.mtp_num_layers is not None
-            self.mtp_unroll_steps = self.mtp_num_layers
-            self.mtp_num_layers = 1
-        else:
-            self.mtp_unroll_steps = self.mtp_num_layers
+            assert self.mtp_num_layers is not None and self.mtp_num_layers > 0, \
+                'mtp_shared_weights requires a positive mtp_num_layers'
+            if not hasattr(self, 'mtp_use_repeated_layer'):
+                # COMPAT(0.16): the field does not exist yet; the block provides the shim.
+                object.__setattr__(self, 'mtp_use_repeated_layer', True)
+            else:
+                self.mtp_use_repeated_layer = True
+        elif not hasattr(self, 'mtp_use_repeated_layer'):
+            object.__setattr__(self, 'mtp_use_repeated_layer', False)
+        if (self.mtp_use_repeated_layer and self.pipeline_model_parallel_layout is not None
+                and (self.mtp_num_layers or 0) > 1
+                and 'mtp_use_repeated_layer' not in TransformerConfig.__dataclass_fields__):
+            # MCore 0.16 only: its layout assert counts MTP entries against
+            # config.mtp_num_layers (the LOGICAL depth) while the bridge
+            # repeated-layer shim physically builds ONE layer -- with depth>1
+            # no consistent layout mapping exists.  Depth 1 is conflict-free
+            # (logical == physical == 1, the pre-migration behaviour) and stays
+            # allowed.  Note for 0.17+: upstream supports repeated layers
+            # natively but its layout assert still requires the custom layout
+            # to declare the LOGICAL depth in MTP entries; layouts written for
+            # the old shared semantics (one physical entry) must be updated
+            # accordingly -- upgrading alone does not remap them.
+            raise ValueError('mtp_shared_weights with mtp_num_layers > 1 and a custom '
+                             'pipeline_model_parallel_layout is not supported on megatron-core 0.16: '
+                             'the upstream layout assert counts MTP entries against the logical depth '
+                             'while the repeated-layer shim builds one physical layer. Use depth 1, '
+                             'drop the custom layout, or use megatron-core >= 0.17 with a layout that '
+                             'declares mtp_num_layers MTP entries.')
+        # Legacy alias kept for downstream code that still reads it
+        self.mtp_unroll_steps = self.mtp_num_layers
         # ``num_nextn_predict_layers`` counts the draft layers for both DeepSeek's standard MTP and
         # V4.1's DSpark, so it alone cannot tell them apart: on a plain V3/V4 checkpoint it means MTP
         # and there is no DSpark at all. ``dspark_block_size`` is what actually marks a DSpark
