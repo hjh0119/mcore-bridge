@@ -49,6 +49,7 @@ def test_prepare_mtp_loss_mask_merges_ignore_index():
 def test_mtp_block_patch_restores_after_build():
     """A leaked class patch would make later model builds depend on test order."""
     from megatron.core.models.gpt import gpt_model
+
     from mcore_bridge.model.register import ModelLoader
 
     before = gpt_model.MultiTokenPredictionBlock
@@ -60,6 +61,7 @@ def test_mtp_block_patch_restores_after_build():
 
 def test_mtp_block_patch_noop_without_mtp():
     from megatron.core.models.gpt import gpt_model
+
     from mcore_bridge.model.register import ModelLoader
 
     before = gpt_model.MultiTokenPredictionBlock

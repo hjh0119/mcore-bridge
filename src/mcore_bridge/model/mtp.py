@@ -25,6 +25,7 @@ logger = get_logger()
 #   SEMANTICS        deliberate bridge behavior kept for legacy parity; not a bug.
 #   UPSTREAM         workaround for an upstream defect; drop once upstream fixes it.
 
+
 @dataclass(frozen=True)
 class MtpCapabilities:
     has_process_mtp_loss: bool = False
@@ -552,8 +553,7 @@ class MultiTokenPredictionBlock(McoreMultiTokenPredictionBlock):
 
     def forward(self, input_ids, position_ids, hidden_states, attention_mask, **kwargs):
         if kwargs.get('inference_params') is not None:
-            raise NotImplementedError(
-                'MTP inference is not supported by mcore-bridge')
+            raise NotImplementedError('MTP inference is not supported by mcore-bridge')
         caps = get_mtp_capabilities()
 
         decoder_input = kwargs.pop('decoder_input', None)
@@ -607,9 +607,8 @@ class MultiTokenPredictionBlock(McoreMultiTokenPredictionBlock):
         kwargs = {**kwargs, **extra}
 
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
-        assert offset == 0, (
-            f'MTP does not support a pipeline offset (got {offset}): process_mtp_loss chunks the '
-            'output by 1 + mtp_num_layers, which only matches when no offset chunks are prepended.')
+        assert offset == 0, (f'MTP does not support a pipeline offset (got {offset}): process_mtp_loss chunks the '
+                             'output by 1 + mtp_num_layers, which only matches when no offset chunks are prepended.')
         hs_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hs = hs_list[offset]
 
