@@ -1,9 +1,5 @@
-"""QSA packed block form: every attended key must be selected, and its tile listed.
-
-CPU-only. Guards the packed/thd coordinate bug: a sequence whose first token is not
-on the global ``token // R`` grid used to flag two bitmap columns per selected block,
-so an unselected block sandwiched between two selected ones was attended as well.
-"""
+"""CPU-only: a packed selection must attend exactly its keys, and the tile map must
+list every attended key's tile."""
 import random
 
 import pytest
@@ -83,8 +79,7 @@ def test_packed_off_grid_attends_exactly_the_selection(lens, ratio):
     rows = torch.arange(idx.shape[0]).unsqueeze(1).expand_as(idx)
     valid = idx >= 0
     exact[rows[valid], idx[valid]] = True
-    # rows may list the whole current block; the kernel clips at [lo, hi] =
-    # [sequence start, query position]
+    # rows may list the current block whole; the kernel clips at [lo, hi]
     keys = torch.arange(idx.shape[0])
     exact &= (keys[None, :] >= lo[:, None]) & (keys[None, :] <= hi[:, None])
 

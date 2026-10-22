@@ -1,22 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """QSA sparse attention wrappers around the vendored tensor-core triton kernel.
 
-The kernel itself lives in ``qsa_block_sparse_attn.py``, a verbatim copy of
-miles ``miles/kernels/attention/qsa/block_sparse_attention.py`` (plus mcore's
-int64 address casts). This file owns only the glue mcore needs: the packed
-block form, sbhd<->thd flattening, context parallelism, and the
-``core_attention`` shim.
+The kernel itself lives in ``qsa_block_sparse_attn.py`` (vendored from miles). This
+file owns the glue: the packed block form, sbhd<->thd flattening, context
+parallelism, and the ``core_attention`` shim.
 
-BLOCK FORM (why the glue looks the way it does)
-    The indexer selects whole blocks that start at each document's own first
-    token (``doc_start + m * R + arange(R)``), which need not sit on the global
-    ``token // R`` grid. The kernel therefore takes three per-sequence inputs:
-    ``tok_base``/``blk_base`` (sequence start and its first block id) and
-    ``block_first``/``block_last`` (each block's inclusive token span). Building
-    them from ``cu_seqlens`` is this file's job -- ``_PackedBlockLayout`` --
-    exactly like miles' ``PackedBlockLayout`` + ``_publish_block_form``. Do NOT
-    route packed inputs through ``qsa_sparse_attention_from_indices``: that
-    helper assumes one sequence on the global grid.
+The indexer selects whole blocks on each document's own grid (``doc_start + m * R``),
+which need not sit on the global ``token // R`` grid. The packed path therefore builds
+``blk_base``/``tok_base``/``block_first``/``block_last`` from ``cu_seqlens`` in
+``_PackedBlockLayout``; ``qsa_sparse_attention_from_indices`` is global-grid only.
 
 WHY A KERNEL AT ALL (the decision this file encodes)
     QSA needs a per-query key set, which as an attention mask is TE's
@@ -123,12 +115,8 @@ def _cp_gathered_to_logical_order(seq_len: int, cp_size: int, device) -> torch.T
 
 
 def _align_cu_seqlens(cu, total: int):
-    """Return ``cu`` with ``cu[-1] == total``, or ``None`` if it does not describe it.
-
-    Mirrors ``Qwen4ExpTextPLELayer._normalize_cu_seqlens``: packing under CP hands
-    over the padded ``cu``, and some callers omit the leading 0 or carry a batch
-    offset. ``total`` is the token count the kernel will index (``len(q)``).
-    """
+    """Return ``cu`` ending at ``total``, accepting a missing leading 0 or a batch
+    offset; ``None`` when it cannot describe ``total`` tokens."""
     cu = cu.reshape(-1).to(dtype=torch.long)
     if cu.numel() > 0 and int(cu[0]) != 0:
         if int(cu[-1]) == total:
@@ -141,12 +129,8 @@ def _align_cu_seqlens(cu, total: int):
 
 
 def _packed_cu_seqlens(packed_seq_params, total: int):
-    """Resolve the ``cu_seqlens`` that matches ``total`` packed tokens.
-
-    Padded first: under CP the gathered k/v (and the scattered q buffer) live in
-    padded pack space, while plain padding_free packing has no padding and both
-    entries coincide.
-    """
+    """Resolve the ``cu_seqlens`` matching ``total`` packed tokens; padded first (it is
+    the pack space CP gathers into)."""
     if packed_seq_params is None:
         raise ValueError('QSA packed attention needs packed_seq_params.cu_seqlens_q to place every '
                          f'sequence on its own block grid, but none was passed for {total} tokens.')
@@ -163,14 +147,9 @@ def _packed_cu_seqlens(packed_seq_params, total: int):
 
 
 class _PackedBlockLayout:
-    """Per-sequence compressed-block grid for a packed / flattened batch.
-
-    Block ``m`` of a sequence covers ``[seq_start + m * R, seq_start + (m + 1) * R)``
-    -- the grid the indexer selects on. Block ids therefore form one global
-    numbering of size ``sum(ceil(len_d / R))`` (the tail block included), and
-    ``block_first_token`` / ``block_last_token`` give every block's exact token
-    span, which is what makes the kernel's tile map independent of any
-    global-grid alignment (miles' ``PackedBlockLayout``).
+    """Per-sequence block grid: block ``m`` covers ``[start + m*R, start + (m+1)*R)``
+    and ids form one global numbering of size ``sum(ceil(len_d / R))``; the exact
+    per-block token spans feed the kernel's tile map.
     """
 
     def __init__(self, cu_seqlens, compress_ratio: int, device):
@@ -197,14 +176,9 @@ class _PackedBlockLayout:
 
 
 def _block_form(indices, layout: _PackedBlockLayout, block_size: int):
-    """Token-space selection rows -> the tensor-core kernel's block form.
-
-    Returns ``(sel, lo, hi, blk_base, tok_base, block_first, block_last)`` with the
-    same semantics as miles' ``_publish_block_form``: ``sel`` is
-    ``[T, layout.num_blocks]`` and a row's block id for token ``t`` is
-    ``blk_base + (t - tok_base) // R``. ``lo``/``hi`` are the inclusive key range
-    (sequence start .. query position); block membership supplies the holes.
-    """
+    """Rows -> ``(sel, lo, hi, blk_base, tok_base, block_first, block_last)``: a
+    token's block id is ``blk_base + (token - tok_base) // R`` and ``lo``/``hi`` is
+    ``[sequence start, query position]`` (block membership supplies the holes)."""
     device = indices.device
     total = indices.shape[0]
     tok_base = layout.token_start.to(torch.int32)
@@ -224,13 +198,9 @@ def _block_form(indices, layout: _PackedBlockLayout, block_size: int):
 def qsa_sparse_attention_thd(q, k, v, indices, cu_seqlens, scale, block_size):
     """``q`` [T, Hq, D], ``k``/``v`` [S, Hkv, D], ``indices`` [T, K] (-1 pad).
 
-    Token-space indices address one packed/flattened token buffer; ``cu_seqlens``
-    gives every sequence's start so its blocks can be placed on its own grid
-    (``_PackedBlockLayout``).
-
-    ``block_size`` must be the indexer's ``compress_ratio``: the kernel tests
-    membership per block of that many consecutive tokens, so passing a different
-    value silently changes which keys are attended.
+    ``cu_seqlens`` gives every sequence's start (``_PackedBlockLayout``). ``block_size``
+    must be the indexer's ``compress_ratio``: a different value silently changes which
+    keys are attended.
     """
     if not HAVE_TRITON or q.device.type == 'cpu':
         raise RuntimeError('QSA sparse attention requires triton and accelerator tensors '
@@ -275,9 +245,7 @@ def qsa_sparse_attention(q, k, v, indices, scale, block_size, cu_seqlens=None):
     q_f = q.permute(1, 0, 2, 3).reshape(b * s, hq, d)
     k_f = k.permute(1, 0, 2, 3).reshape(b * sk, *k.shape[2:])
     v_f = v.permute(1, 0, 2, 3).reshape(b * sk, *v.shape[2:])
-    # Flatten to token space, batch-major: token t = r * sk + p. Each sample is one
-    # sequence of length sk, so its first token is a sequence start for the layout --
-    # no `sk % block_size == 0` requirement any more.
+    # batch-major flattening: token t = r * sk + p, one sequence per sample
     off = torch.arange(b, device=q.device).view(b, 1, 1) * sk
     idx_f = torch.where(indices >= 0, indices + off, indices.new_full((), -1)).reshape(b * s, -1)
     cu = torch.arange(b + 1, device=q.device, dtype=torch.int64) * sk
@@ -330,10 +298,7 @@ class QSASparseCoreAttention(torch.nn.Module):
         if attention_mask is not None and attention_mask.dtype in (torch.int32, torch.int64):
             scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1]**-0.5
             cp_size = self.config.context_parallel_size
-            # thd needs the sequence starts to place every sequence on its own block
-            # grid; sbhd treats each sample as one sequence and builds the layout
-            # itself. Under CP the local query is only a shard, so the cu is resolved
-            # in _forward_cp against the gathered (full) length instead.
+            # Under CP the local query is only a shard, so _forward_cp resolves its own cu.
             cu = _packed_cu_seqlens(packed_seq_params, query.shape[0]) \
                 if query.dim() == 3 and cp_size == 1 else None
             if cp_size > 1:

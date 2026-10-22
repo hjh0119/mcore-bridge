@@ -92,9 +92,7 @@ def _dense_reference(q, k, v, idx, scale):
     ([5, 61, 6], 5),
 ])
 def test_qsa_off_grid_packed_matches_dense(lengths, ratio):
-    """Packed documents whose first token is off the global ``token // R`` grid must
-    attend exactly their selection -- the bug this guards leaked every block that sat
-    between two selected blocks."""
+    """Off-grid packed documents must attend exactly their selection (fwd + bwd)."""
     torch.manual_seed(7)
     idx, cu = _packed_indexer_rows(lengths, ratio)
     total, d, hq = idx.shape[0], 32, 2
@@ -119,8 +117,7 @@ def test_qsa_off_grid_packed_matches_dense(lengths, ratio):
 
 
 def test_qsa_sbhd_flattening_keeps_each_sample_on_its_own_grid():
-    """sbhd flattening (batch-major) must treat each sample as its own sequence; the
-    sample stride no longer has to be a multiple of the block size."""
+    """sbhd flattening treats each sample as its own sequence."""
     torch.manual_seed(11)
     s, b, d, hq, hkv, ratio = 20, 2, 32, 2, 1, 4
     # per-sample rows on the sample's own grid, with holes
@@ -151,8 +148,7 @@ def test_qsa_sbhd_flattening_keeps_each_sample_on_its_own_grid():
 
 
 def test_qsa_core_attention_shim_resolves_packed_cu():
-    """QSASparseCoreAttention.forward must resolve cu_seqlens from packed_seq_params; a
-    packed call that loses it would silently fall back to the global-grid bitmap."""
+    """forward must resolve cu_seqlens from packed_seq_params for packed inputs."""
     from mcore_bridge.model.modules.kernels import QSASparseCoreAttention
 
     class _Config:
