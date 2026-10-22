@@ -1,15 +1,15 @@
 """CPU-only: a packed selection must attend exactly its keys, and the tile map must
 list every attended key's tile."""
-import random
-
 import pytest
+import random
 
 torch = pytest.importorskip('torch')
 pytest.importorskip('triton')
 
 from mcore_bridge.model.modules.kernels import qsa_kernels as qk  # noqa: E402
-from mcore_bridge.model.modules.kernels.qsa_block_sparse_attn import (  # noqa: E402
-    build_tile_index, build_tile_index_pair)
+from mcore_bridge.model.modules.kernels.qsa_block_sparse_attn import (
+    build_tile_index,  # noqa: E402
+    build_tile_index_pair)
 
 BQ = 64
 _rng = random.Random(0)
