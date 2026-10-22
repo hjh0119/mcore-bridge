@@ -727,4 +727,5 @@ register_model(
         ['deepseek_v4'],
         bridge_cls=DeepseekV4Bridge,
         loader=DeepseekV4Loader,
+        mtp_prefix='model.mtp',
     ))

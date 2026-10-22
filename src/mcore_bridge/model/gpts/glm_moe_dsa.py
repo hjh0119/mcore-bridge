@@ -47,4 +47,5 @@ register_model(ModelMeta(
     ModelType.glm_moe_dsa,
     ['glm_moe_dsa'],
     loader=GlmMoeDsaLoader,
+    mtp_prefix='model.layers',
 ))

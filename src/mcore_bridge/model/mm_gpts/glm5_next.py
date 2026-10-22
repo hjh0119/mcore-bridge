@@ -697,4 +697,5 @@ register_model(
         bridge_cls=Glm5NextBridge,
         visual_cls=Glm5NextVit,
         loader=Glm5NextLoader,
+        mtp_prefix='model.layers',
     ))

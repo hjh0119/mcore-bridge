@@ -436,4 +436,6 @@ if _HYBRID_MODEL_AVAILABLE:
             ['nemotron_h'],
             bridge_cls=NemotronHBridge,
             loader=NemotronHLoader,
+            mtp_prefix='mtp',
+            mtp_depth_field='mtp_num_hidden_layers',
         ))

@@ -42,6 +42,9 @@ class ModelMeta:
     is_multimodal: bool = False
     loader: Optional[Type['ModelLoader']] = None
     config_cls: Type[ModelConfig] = ModelConfig
+    mtp_prefix: Optional[str] = None
+    # Most HF checkpoints declare MTP depth here; Qwen models override it.
+    mtp_depth_field: Optional[str] = 'num_nextn_predict_layers'
 
     def __post_init__(self):
         if self.visual_cls is not None:

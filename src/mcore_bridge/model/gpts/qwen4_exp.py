@@ -765,15 +765,10 @@ class Qwen4ExpLoader(ModelLoader):
         if mtp_block_spec is not None:
             for layer_spec in mtp_block_spec.layer_specs:
                 sub = layer_spec.submodules
-                # The residual_linear_shared head needs Megatron's mHC *projection* form (separate
-                # e_proj/h_proj slots). megatron-core <= 0.18 only has the fused eh_proj slot, and
-                # assigning e_proj/h_proj there would silently no-op and surface later as an
-                # AttributeError on self.e_proj -- so reject early and name the fix.
                 if not (hasattr(sub, 'e_proj') and hasattr(sub, 'h_proj')):
-                    raise NotImplementedError(
-                        'Qwen3.8-Flash-Next MTP requires a Megatron whose MultiTokenPredictionLayerSubmodules '
-                        'exposes e_proj/h_proj (megatron-core >= 0.19 / dev); got '
-                        f'{megatron.core.__version__}.')
+                    raise NotImplementedError('Qwen3.8-Flash-Next MTP requires a Megatron dev build exposing separate '
+                                              f'e_proj/h_proj, got {megatron.core.__version__}.'
+                                              'run pip install "git+https://github.com/NVIDIA/Megatron-LM.git@dev"')
                 layer_spec.module = Qwen4ExpMultiTokenPredictionLayer
                 # residual_linear_shared head: separate e_proj/h_proj (fc_embedding/fc_hidden), a joint
                 # multi-stream hnorm (pre_fc_norm_hidden over n*H), and no fused eh_proj. layer_norm

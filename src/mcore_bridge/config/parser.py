@@ -3,9 +3,11 @@ import torch.nn.functional as F
 from functools import partial
 from megatron.core.activations import squared_relu
 from transformers import PretrainedConfig
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from mcore_bridge.utils import get_env_args
+from mcore_bridge.utils import get_env_args, get_logger
+
+logger = get_logger()
 
 config_mapping = {
     'num_layers': ['num_hidden_layers'],
@@ -185,7 +187,8 @@ def _get_tie_word_embeddings(config_dict):
     return tie_word_embeddings
 
 
-def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
+def hf_to_mcore_config(hf_config: PretrainedConfig, *, model_meta=None, model_dir: Optional[str] = None,
+                       mtp_num_layers=None, mtp_shared_weights: Optional[bool] = None) -> Dict[str, Any]:
     res = _convert_config(hf_config)
     if hf_config.name_or_path:
         # fix Qwen3-Omni
@@ -437,4 +440,28 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res['moe_router_enable_expert_bias'] = True
     if n_shared_experts is not None and 'moe_shared_expert_intermediate_size' not in res:
         res['moe_shared_expert_intermediate_size'] = n_shared_experts * res['moe_ffn_hidden_size']
+
+    if model_meta is not None:
+        from mcore_bridge.model.mtp_detect import resolve_mtp_config
+
+        resolution = resolve_mtp_config(model_meta, hf_config, model_dir or hf_config.name_or_path,
+                                        requested_num_layers=mtp_num_layers,
+                                        requested_shared_weights=mtp_shared_weights)
+        res['mtp_num_layers'] = resolution.num_layers
+        res['mtp_shared_weights'] = resolution.shared_weights
+        if mtp_num_layers == 'auto':
+            logger.info(f'mtp_num_layers auto-resolved to {resolution.num_layers}.')
+        elif mtp_num_layers is None and resolution.physical_sets:
+            logger.warning(f'The checkpoint contains MTP weights (depth={resolution.physical_sets}) but '
+                           '`mtp_num_layers` is not set; MTP is disabled and the exported model will not contain '
+                           'MTP. Set `--mtp_num_layers auto` to keep it.')
+        if mtp_shared_weights is None and resolution.shared_weights:
+            logger.info(f'Auto-enabled mtp_shared_weights: mtp_num_layers={resolution.num_layers} exceeds the '
+                        f'{resolution.physical_sets} physical MTP set(s) in the checkpoint.')
+        elif mtp_shared_weights is False and resolution.physical_sets and resolution.num_layers \
+                and resolution.num_layers > resolution.physical_sets:
+            logger.warning(f'The checkpoint stores {resolution.physical_sets} physical MTP set(s), but '
+                           f'`mtp_num_layers={resolution.num_layers}`. The extra depths have no weights; set '
+                           '`--mtp_shared_weights true` to reuse one set (mtp-k), or '
+                           '`--mtp_allow_random_init true` to initialize them randomly.')
     return res

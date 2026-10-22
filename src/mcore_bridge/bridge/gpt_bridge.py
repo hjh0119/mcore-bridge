@@ -2003,7 +2003,8 @@ class GPTBridge:
                 if not self.config.mtp_allow_random_init:
                     raise ValueError(f'MTP weights not found under {expected} (expected '
                                      f'{self.config.mtp_num_layers} physical set(s) after the {self.config.num_layers} '
-                                     'decoder layers). Set mtp_allow_random_init=True to train MTP from random init.')
+                                     'decoder layers). Set mtp_shared_weights=True to reuse one set across depths, or '
+                                     'mtp_allow_random_init=True to train MTP from random init.')
                 logger.warning(f'MTP Layer {mtp_layer.layer_number} weights not found under {expected}; '
                                'randomly initializing (mtp_allow_random_init=True).')
                 for param in mtp_layer.parameters():
