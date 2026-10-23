@@ -12,8 +12,7 @@ def _write_index(model_dir, keys):
 
 
 def _standard_meta():
-    return ModelMeta(
-        'test', ['test'], mtp_prefix='model.layers', mtp_depth_field='num_nextn_predict_layers')
+    return ModelMeta('test', ['test'], mtp_prefix='model.layers', mtp_depth_field='num_nextn_predict_layers')
 
 
 def test_standard_layout_reads_config_and_keys(tmp_path):
@@ -71,6 +70,14 @@ def test_model_mtp_prefix(tmp_path):
     assert resolve_mtp_num_layers(meta, config, str(tmp_path)) == 1
 
 
+def test_model_mtp_direct_numbering(tmp_path):
+    _write_index(tmp_path, ['model.mtp.0.e_proj.weight', 'model.mtp.1.e_proj.weight'])
+    config = SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=2)
+    meta = get_model_meta('deepseek_v4')
+    resolution = resolve_mtp_config(meta, config, str(tmp_path), 'auto', None)
+    assert resolution == (2, False)
+
+
 def test_default_depth_field(tmp_path):
     _write_index(tmp_path, ['model.layers.2.eh_proj.weight'])
     config = SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=1)
@@ -114,7 +121,7 @@ def test_resolve_mtp_config_auto_and_shared(tmp_path):
     )
     for requested_depth, requested_shared, depth, shared in cases:
         resolution = resolve_mtp_config(meta, config, str(tmp_path), requested_depth, requested_shared)
-        assert (resolution.num_layers, resolution.shared_weights, resolution.physical_sets) == (depth, shared, 1)
+        assert resolution == (depth, shared)
 
 
 def test_registered_models_auto_resolution(tmp_path):
@@ -164,6 +171,18 @@ def test_multiple_physical_sets(tmp_path):
     _write_index(tmp_path, ['model.layers.2.eh_proj.weight', 'model.layers.3.eh_proj.weight'])
     config = SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=2)
     assert resolve_mtp_num_layers(_standard_meta(), config, str(tmp_path)) == 2
+    cases = (('auto', None, 2, False), (3, None, 3, False), (3, True, 3, True))
+    for requested_depth, requested_shared, depth, shared in cases:
+        resolution = resolve_mtp_config(_standard_meta(), config, str(tmp_path), requested_depth, requested_shared)
+        assert resolution == (depth, shared)
+
+
+def test_three_physical_sets_keep_independent_weights(tmp_path):
+    _write_index(tmp_path, [f'model.layers.{i}.eh_proj.weight' for i in range(2, 5)])
+    config = SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=3)
+    for requested_depth in ('auto', 3):
+        resolution = resolve_mtp_config(_standard_meta(), config, str(tmp_path), requested_depth, None)
+        assert resolution == (3, False)
 
 
 def test_unreadable_weights_disables_mtp(tmp_path):

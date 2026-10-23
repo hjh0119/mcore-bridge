@@ -12,6 +12,7 @@ Locks the two properties that changed around persistence:
 Building a ``ModelConfig`` instantiates its bridge, which requires a
 model-parallel group, so every case runs inside a single-GPU parallel context.
 """
+import json
 import os
 import pytest
 import torch
@@ -23,7 +24,8 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.config.parser import hf_to_mcore_config
 from mcore_bridge.model.mtp import get_physical_mtp_count
-from mcore_bridge.model.register import get_mcore_model
+from mcore_bridge.model.mtp_detect import resolve_mtp_config
+from mcore_bridge.model.register import get_mcore_model, get_model_meta
 
 # A model build/forward makes Megatron's attention-backend selection export
 # these globally; snapshot/restore them so this file does not leak backend
@@ -66,16 +68,18 @@ def _parallel_context():
 
 def _llama_values(**overrides):
     transformers = pytest.importorskip('transformers')
-    hf = transformers.LlamaConfig(
-        vocab_size=128,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        max_position_embeddings=128,
-        tie_word_embeddings=False,
-    )
+    hf = overrides.pop('hf', None)
+    if hf is None:
+        hf = transformers.LlamaConfig(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            max_position_embeddings=128,
+            tie_word_embeddings=False,
+        )
     values = hf_to_mcore_config(hf)
     values.update(
         params_dtype=torch.float32,
@@ -88,6 +92,25 @@ def _llama_values(**overrides):
 
 def _mtp_layer_indices(state_dict):
     return sorted({k.split('.')[2] for k in state_dict if k.startswith('mtp.layers.')})
+
+
+def test_model_config_accepts_resolved_mtp(tmp_path):
+    values = _llama_values()
+    hf = values['hf_config']
+    with open(tmp_path / 'model.safetensors.index.json', 'w') as f:
+        json.dump({'weight_map': {'model.layers.2.eh_proj.weight': 'x'}}, f)
+    with _parallel_context():
+        for requested_depth, depth, shared in (('auto', 1, False), (3, 3, True)):
+            values['mtp_num_layers'], values['mtp_shared_weights'] = resolve_mtp_config(
+                get_model_meta('gpt'), hf, str(tmp_path), requested_depth, None)
+            cfg = ModelConfig(**values)
+            assert cfg.mtp_num_layers == depth
+            assert cfg.mtp_use_repeated_layer is shared
+
+
+def test_model_config_rejects_unresolved_auto():
+    with pytest.raises(TypeError, match='resolve_mtp_config'):
+        ModelConfig(**_llama_values(mtp_num_layers='auto'))
 
 
 def test_shared_weights_alias_maps_to_repeated_layer():

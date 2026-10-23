@@ -286,7 +286,7 @@ class ModelConfig(TransformerConfig):
     # Allow a full-finetune checkpoint that carries no MTP weights to random-init them.
     # Off by default: a missing MTP key set is usually a wrong path/name, not intent.
     mtp_allow_random_init: bool = False
-    mtp_shared_weights: bool = False
+    mtp_shared_weights: Optional[bool] = None
 
     # visual
     language_model_only: bool = False
@@ -400,6 +400,9 @@ class ModelConfig(TransformerConfig):
             os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
         # mtp_num_layers is always the *logical* prediction depth.
         # mtp_shared_weights is a deprecated alias for mtp_use_repeated_layer.
+        if isinstance(self.mtp_num_layers, str):
+            raise TypeError('mtp_num_layers must be an int or None; '
+                            'use resolve_mtp_config() to resolve "auto".')
         if self.mtp_shared_weights:
             assert self.mtp_num_layers is not None and self.mtp_num_layers > 0, \
                 'mtp_shared_weights requires a positive mtp_num_layers'

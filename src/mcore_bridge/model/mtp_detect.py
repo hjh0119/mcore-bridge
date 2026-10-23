@@ -3,10 +3,12 @@ import glob
 import json
 import os
 import re
-from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from mcore_bridge.utils import get_logger
+
+if TYPE_CHECKING:
+    from .register import ModelMeta
 
 logger = get_logger()
 
@@ -78,7 +80,7 @@ def _count_standard_sets(keys: List[str], num_layers: int) -> int:
 def _count_prefixed_sets(keys: List[str], prefix: str) -> int:
     name = prefix.split('.')[-1]
     wrapper = r'(?:model\.)?(?:language_model\.)?'
-    pattern = re.compile(rf'^{wrapper}{re.escape(name)}\.layers\.(\d+)\.')
+    pattern = re.compile(rf'^{wrapper}{re.escape(name)}\.(?:layers\.)?(\d+)\.')
     indices = {int(match.group(1)) for key in keys if (match := pattern.match(key))}
     if indices:
         return len(indices)
@@ -96,17 +98,21 @@ def _count_mtp_sets(keys: List[str], prefix: str, hf_config) -> int:
     return _count_prefixed_sets(keys, prefix)
 
 
-def resolve_mtp_num_layers(model_meta, hf_config, model_dir: Optional[str], *, warn: bool = True) -> Optional[int]:
+def resolve_mtp_num_layers(model_meta: 'ModelMeta',
+                           hf_config,
+                           model_dir: Optional[str],
+                           *,
+                           warn: bool = True) -> Optional[int]:
     """Resolve the MTP depth stored in a checkpoint.
 
     The config's declared depth is only a hint: some checkpoints declare MTP but omit
     the weights (for example MiniCPM-V), so the weight keys decide whether MTP is
     actually available.
     """
-    prefix = getattr(model_meta, 'mtp_prefix', None)
+    prefix = model_meta.mtp_prefix
     if not prefix:
         return None
-    declared = _get_declared_depth(hf_config, getattr(model_meta, 'mtp_depth_field', None))
+    declared = _get_declared_depth(hf_config, model_meta.mtp_depth_field)
     keys = _read_weight_keys(model_dir)
     if keys is None:
         if warn:
@@ -125,22 +131,11 @@ def resolve_mtp_num_layers(model_meta, hf_config, model_dir: Optional[str], *, w
     return detected
 
 
-@dataclass(frozen=True)
-class MtpResolution:
-    num_layers: Optional[int]
-    shared_weights: bool
-    physical_sets: Optional[int]
-
-
-def resolve_mtp_config(model_meta, hf_config, model_dir: Optional[str], requested_num_layers=None,
-                       requested_shared_weights: Optional[bool] = None) -> MtpResolution:
-    """Resolve the logical MTP depth and whether the physical set is reused.
-
-    ``requested_num_layers`` accepts an integer, ``'auto'`` (follow the checkpoint), or
-    ``None`` (MTP disabled). When ``requested_shared_weights`` is None, reuse is enabled
-    only if the requested depth exceeds the sets actually stored in the checkpoint.
-    """
-    physical = resolve_mtp_num_layers(model_meta, hf_config, model_dir, warn=False)
+def resolve_mtp_config(model_meta: 'ModelMeta', hf_config, model_dir: Optional[str],
+                       requested_num_layers: Optional[Union[int, str]],
+                       requested_shared_weights: Optional[bool]) -> Tuple[Optional[int], bool]:
+    """Resolve MTP depth, automatically reusing weights only from a single physical set."""
+    physical = resolve_mtp_num_layers(model_meta, hf_config, model_dir, warn=requested_num_layers == 'auto')
     if requested_num_layers == 'auto':
         num_layers = physical
     elif requested_num_layers is None:
@@ -148,7 +143,9 @@ def resolve_mtp_config(model_meta, hf_config, model_dir: Optional[str], requeste
     else:
         num_layers = int(requested_num_layers)
     if requested_shared_weights is None:
-        shared_weights = bool(physical and num_layers and num_layers > physical)
+        shared_weights = bool(physical == 1 and num_layers and num_layers > 1)
     else:
-        shared_weights = bool(requested_shared_weights)
-    return MtpResolution(num_layers=num_layers, shared_weights=shared_weights, physical_sets=physical)
+        shared_weights = requested_shared_weights
+    if requested_num_layers == 'auto' or requested_shared_weights is None:
+        logger.info(f'MTP configuration: mtp_num_layers={num_layers}, mtp_shared_weights={shared_weights}')
+    return num_layers, shared_weights
