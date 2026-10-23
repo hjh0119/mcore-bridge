@@ -71,6 +71,40 @@ def test_mtp_block_patch_noop_without_mtp():
     assert gpt_model.MultiTokenPredictionBlock is before
 
 
+def test_get_embeddings_preserves_upstream_tuple_shape(monkeypatch):
+    """The override must mirror 4/5/6-value upstream returns, including mtp_input_mask."""
+
+    class _EmbeddingLayer(MultiTokenPredictionLayer):
+
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.config = SimpleNamespace(
+                sequence_parallel=False,
+                tensor_model_parallel_size=1,
+                mtp_decoder_input_detach=False,
+                mtp_detach_heads=False,
+            )
+            self._pending_decoder_input = None
+            self._pending_depth = 0
+
+    layer = _EmbeddingLayer()
+    ids = torch.zeros(1, 2, dtype=torch.long)
+    dec = torch.zeros(1, 2, 4)
+    hs = torch.zeros(1, 2, 4)
+    pmask = torch.zeros(1, 2, dtype=torch.bool)
+    mtp_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    for result in ((ids, ids, dec, hs), (ids, ids, pmask, dec, hs),
+                   (ids, ids, pmask, mtp_mask, dec, hs)):
+        monkeypatch.setattr(mtp_mod.McoreMultiTokenPredictionLayer, '_get_embeddings',
+                            lambda *args, _result=result, **kwargs: _result)
+        out = layer._get_embeddings(input_ids=ids, position_ids=ids)
+        assert len(out) == len(result)
+        assert torch.equal(out[-2], dec)
+        if len(result) == 6:
+            assert out[3] is mtp_mask
+
+
 def test_get_inner_layer_kwargs_routes_into_extras(monkeypatch):
     """Model hooks feed the inner transformer layer through the staged extras channel."""
     captured = {}

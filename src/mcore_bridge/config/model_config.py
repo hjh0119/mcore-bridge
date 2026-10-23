@@ -250,6 +250,10 @@ class ModelConfig(TransformerConfig):
     csa_compress_rotary_base: float = 40000.0
     o_groups: int = 8
     o_lora_rank: int = 1024
+    # COMPAT(dev): mcore renamed the DeepSeek-V4 output projection fields;
+    # TransformerConfig's alias migration expects both names to exist.
+    output_projection_groups: int = 8
+    output_projection_lora_rank: int = 1024
     enable_hyper_connections: bool = False
     num_residual_streams: int = 4
     mhc_sinkhorn_iterations: int = 20

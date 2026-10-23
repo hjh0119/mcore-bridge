@@ -12,6 +12,7 @@ from mcore_bridge.utils import get_logger
 
 from ..constant import ModelType
 from ..mm_gpt_model import MultimodalGPTModel
+from ..mtp import get_physical_mtp_depth
 from ..register import ModelLoader, ModelMeta, register_model
 from .utils import HuggingFaceVit
 
@@ -216,7 +217,7 @@ class Glm5NextHybridModel(HybridModel):
         # parse_hybrid_pattern splits on '/' and keeps '|' inside the main pattern for PP boundaries;
         # the MTP inner block (DSA + MoE, no hyper-connections) is described by mtp_hybrid_override_pattern.
         mtp_pattern = getattr(config, 'mtp_hybrid_override_pattern', None)
-        mtp_num_layers = getattr(config, 'mtp_num_layers', None)
+        mtp_num_layers = get_physical_mtp_depth(config)
         if mtp_pattern and mtp_num_layers and '/' not in main:
             main = main + '/' + '/'.join([mtp_pattern] * mtp_num_layers)
         return main

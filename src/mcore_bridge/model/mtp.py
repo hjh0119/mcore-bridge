@@ -37,7 +37,6 @@ class MtpCapabilities:
     layer_forward_params: Tuple[str, ...] = ()
     layer_returns_padding_mask: bool = False
 
-    get_embeddings_returns_padding_mask: bool = False
     checkpointed_forward_accepts_padding_mask: bool = False
     # COMPAT(0.17): 0.16/0.17 contract _checkpointed_forward(forward_func, *args, **kwargs),
     # whose *kwargs.values() pass-through rejects non-tensor args.
@@ -84,7 +83,6 @@ def get_mtp_capabilities() -> MtpCapabilities:
 
     proc = getattr(_mtp_mod, 'process_mtp_loss', None)
     layer_fwd = _params(McoreMultiTokenPredictionLayer.forward)
-    get_emb = _params(McoreMultiTokenPredictionLayer._get_embeddings)
     ckpt = _params(getattr(McoreMultiTokenPredictionLayer, '_checkpointed_forward', None))
     block_fwd = _params(McoreMultiTokenPredictionBlock.forward)
 
@@ -95,7 +93,6 @@ def get_mtp_capabilities() -> MtpCapabilities:
         has_detach_heads='mtp_detach_heads' in tc,
         layer_forward_params=layer_fwd,
         layer_returns_padding_mask='padding_mask' in layer_fwd,
-        get_embeddings_returns_padding_mask='padding_mask' in get_emb,
         checkpointed_forward_accepts_padding_mask='padding_mask' in ckpt,
         checkpoint_takes_forward_func='forward_func' in ckpt,
         block_forward_params=block_fwd,
@@ -137,6 +134,13 @@ def get_physical_mtp_count(model) -> int:
     """Physical MTP layers: 1 under repeated/shared weights, else the logical depth."""
     mtp = getattr(model, 'mtp', None)
     return len(mtp.layers) if mtp is not None else 0
+
+
+def get_physical_mtp_depth(config) -> int:
+    """Physical MTP layers implied by a config, before the model is built."""
+    depth = getattr(config, 'mtp_num_layers', None) or 0
+    repeated = getattr(config, 'mtp_use_repeated_layer', False) or getattr(config, 'mtp_shared_weights', False)
+    return 1 if depth and repeated else depth
 
 
 def get_mtp_inner_layer(mtp_layer):
@@ -373,12 +377,14 @@ class MultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
             kwargs['embedding'] = _PrecomputedEmbeddingStub(kwargs['embedding'], placeholder)
         result = McoreMultiTokenPredictionLayer._get_embeddings(self, *args, **kwargs)
 
-        # COMPAT(0.18): 0.16/0.17 return a 4-tuple without padding_mask.
-        if caps.get_embeddings_returns_padding_mask:
-            ids, pos, pmask, dec, hs = result
-        else:
-            ids, pos, dec, hs = result
-            pmask = None
+        # Upstream returns 4 (0.16/0.17), 5 (0.18/0.19), or 6 (dev) values.
+        # Keep the tuple shape intact so the caller's unpacking matches, and
+        # retain mtp_input_mask when upstream provides it.
+        values = list(result)
+        if len(values) not in (4, 5, 6):
+            raise ValueError(f'Unexpected _get_embeddings result length: {len(values)}')
+        mtp_input_mask = values[3] if len(values) == 6 else None
+        dec = values[-2]
 
         if pre is not None:
             from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
@@ -399,6 +405,9 @@ class MultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
             if sp:
                 rolled = scatter_to_sequence_parallel_region(rolled)
             dec = rolled
+            if mtp_input_mask is not None:
+                valid_decoder_input = mtp_input_mask.transpose(0, 1).unsqueeze(-1)
+                dec = torch.where(valid_decoder_input, dec, dec.detach())
             # Upstream detaches the embedding-derived decoder input before this
             # replacement; mirror it so the flag is not bypassed on this path.
             if caps.has_detach_heads and getattr(self.config, 'mtp_detach_heads', False):
@@ -408,9 +417,8 @@ class MultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
         if getattr(self.config, 'mtp_decoder_input_detach', False):
             dec = dec.detach()
 
-        if caps.get_embeddings_returns_padding_mask:
-            return ids, pos, pmask, dec, hs
-        return ids, pos, dec, hs
+        values[-2] = dec
+        return tuple(values)
 
     def _shift_rope(self, rope, depth: int, position_ids=None, packed_seq_params=None):
         """Shift RoPE by cumulative logical depth (matching the legacy per-layer
@@ -645,11 +653,20 @@ class MultiTokenPredictionBlock(McoreMultiTokenPredictionBlock):
                 attention_mask=attention_mask,
                 **lk)
 
-            if caps.layer_returns_padding_mask:
-                hs_out, input_ids, position_ids, pmask = res
+            values = tuple(res)
+            if len(values) == 5:
+                hs_out, input_ids, position_ids, pmask, mtp_input_mask = values
                 base_kw['padding_mask'] = pmask
+                if 'mtp_input_mask' not in allowed:
+                    raise RuntimeError('Upstream MTP layer returns mtp_input_mask but does not accept it')
+                base_kw['mtp_input_mask'] = mtp_input_mask
+            elif len(values) == 4:
+                hs_out, input_ids, position_ids, pmask = values
+                base_kw['padding_mask'] = pmask
+            elif len(values) == 3:
+                hs_out, input_ids, position_ids = values
             else:
-                hs_out, input_ids, position_ids = res
+                raise ValueError(f'Unexpected MTP layer result length: {len(values)}')
 
             if mhc_multistream is not None:
                 mhc_chunks.append(hs_out)
