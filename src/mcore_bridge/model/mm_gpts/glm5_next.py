@@ -42,8 +42,7 @@ logger = get_logger()
 # today. Probe it anyway so a backport (or a release that grows the hybrid stack) cannot silently
 # turn this call site into a TypeError.
 _SELECT_PIPELINE_SEGMENT_TAKES_CONFIG = (
-    select_pipeline_segment is not None
-    and 'config' in inspect.signature(select_pipeline_segment).parameters)
+    select_pipeline_segment is not None and 'config' in inspect.signature(select_pipeline_segment).parameters)
 
 # Probes for require_glm5_hybrid(): the hybrid-stack APIs this model is built on, and the
 # TransformerConfig fields that only the packaged patch provides.
