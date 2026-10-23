@@ -94,10 +94,9 @@ def test_get_embeddings_preserves_upstream_tuple_shape(monkeypatch):
     pmask = torch.zeros(1, 2, dtype=torch.bool)
     mtp_mask = torch.ones(1, 2, dtype=torch.bool)
 
-    for result in ((ids, ids, dec, hs), (ids, ids, pmask, dec, hs),
-                   (ids, ids, pmask, mtp_mask, dec, hs)):
-        monkeypatch.setattr(mtp_mod.McoreMultiTokenPredictionLayer, '_get_embeddings',
-                            lambda *args, _result=result, **kwargs: _result)
+    for result in ((ids, ids, dec, hs), (ids, ids, pmask, dec, hs), (ids, ids, pmask, mtp_mask, dec, hs)):
+        monkeypatch.setattr(
+            mtp_mod.McoreMultiTokenPredictionLayer, '_get_embeddings', lambda *args, _result=result, **kwargs: _result)
         out = layer._get_embeddings(input_ids=ids, position_ids=ids)
         assert len(out) == len(result)
         assert torch.equal(out[-2], dec)
