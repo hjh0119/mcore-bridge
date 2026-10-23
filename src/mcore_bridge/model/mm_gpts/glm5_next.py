@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import inspect
 import torch
 import torch.nn as nn
 from copy import deepcopy
@@ -33,6 +34,16 @@ except ImportError:
     parse_hybrid_pattern = select_pipeline_segment = mark_keep_in_fp32 = None
 
 logger = get_logger()
+
+# Megatron 0.20 added a required `config` argument to select_pipeline_segment (the hybrid stack now
+# returns per-layer TransformerConfig objects instead of layer symbols); 0.18/0.19 take
+# `(main_pattern, pp_group, vp_stage, ...)`. GLM-5.3 itself is a dev-only feature -- a release without
+# the packaged patch is rejected earlier by require_glm5_hybrid() -- so only the 0.20 signature runs
+# today. Probe it anyway so a backport (or a release that grows the hybrid stack) cannot silently
+# turn this call site into a TypeError.
+_SELECT_PIPELINE_SEGMENT_TAKES_CONFIG = (
+    select_pipeline_segment is not None
+    and 'config' in inspect.signature(select_pipeline_segment).parameters)
 
 # Probes for require_glm5_hybrid(): the hybrid-stack APIs this model is built on, and the
 # TransformerConfig fields that only the packaged patch provides.
@@ -227,15 +238,17 @@ class Glm5NextHybridModel(HybridModel):
         from megatron.core.process_groups_config import ProcessGroupCollection
         pg = ProcessGroupCollection.use_mpu_process_groups()
         pattern = self._resolve_hybrid_layer_pattern(config)
-        segment, offset = select_pipeline_segment(
-            parse_hybrid_pattern(pattern).main_pattern,
-            pg.pp,
-            vp_stage,
-            first_stage_layers=config.num_layers_in_first_pipeline_stage,
-            last_stage_layers=config.num_layers_in_last_pipeline_stage,
-            tp_group=pg.tp,
-            dp_cp_group=pg.dp_cp,
-        )
+        segment_kwargs = {
+            'first_stage_layers': config.num_layers_in_first_pipeline_stage,
+            'last_stage_layers': config.num_layers_in_last_pipeline_stage,
+            'tp_group': pg.tp,
+            'dp_cp_group': pg.dp_cp,
+        }
+        main_pattern = parse_hybrid_pattern(pattern).main_pattern
+        if _SELECT_PIPELINE_SEGMENT_TAKES_CONFIG:
+            segment, offset = select_pipeline_segment(main_pattern, config, pg.pp, vp_stage, **segment_kwargs)
+        else:
+            segment, offset = select_pipeline_segment(main_pattern, pg.pp, vp_stage, **segment_kwargs)
         if offset % 2 or len(segment) % 2:
             raise ValueError(
                 f'Pipeline stage boundaries of the current model must fall on complete attention+FFN blocks, '

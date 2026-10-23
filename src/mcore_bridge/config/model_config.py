@@ -250,6 +250,10 @@ class ModelConfig(TransformerConfig):
     csa_compress_rotary_base: float = 40000.0
     o_groups: int = 8
     o_lora_rank: int = 1024
+    # Canonical names consumed by TransformerConfig.__post_init__ since the main->dev sync (0.20+);
+    # `o_groups` / `o_lora_rank` remain the dev-era aliases and are reconciled against these.
+    output_projection_groups: int = 8
+    output_projection_lora_rank: int = 1024
     enable_hyper_connections: bool = False
     num_residual_streams: int = 4
     mhc_sinkhorn_iterations: int = 20
