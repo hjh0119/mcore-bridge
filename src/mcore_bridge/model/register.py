@@ -44,7 +44,11 @@ class ModelMeta:
     config_cls: Type[ModelConfig] = ModelConfig
     mtp_prefix: Optional[str] = None
     # Most HF checkpoints declare MTP depth here; Qwen models override it.
+    # Dotted paths are accepted for composite configs.
     mtp_depth_field: Optional[str] = 'num_nextn_predict_layers'
+    mtp_repeated_field: Optional[str] = None
+    # Number of physical modules in one MTP prediction step (for hybrid MTP).
+    mtp_layers_per_depth: int = 1
 
     def __post_init__(self):
         if self.visual_cls is not None:
