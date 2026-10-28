@@ -5,9 +5,9 @@ import re
 import torch
 from dataclasses import dataclass
 from functools import partial
+from transformers import PretrainedConfig
 from types import SimpleNamespace
 from typing import Optional
-from transformers import PretrainedConfig
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils.safetensors import LazyTensor
@@ -160,9 +160,9 @@ class NemoSpeechLMVit(HuggingFaceVit):
     test_mm_type = 'audio'
 
     def prepare_model(self, hf_config: PretrainedConfig):
-        from omegaconf import DictConfig
         from nemo.collections.asr.modules.parallel_expert_encoder import ParallelExpertEncoderPT
         from nemo.collections.speechlm2.modules import AudioPerceptionModule
+        from omegaconf import DictConfig
 
         self.perception = AudioPerceptionModule(DictConfig(hf_config.perception))
         self.perception.encoder = ParallelExpertEncoderPT.from_inline_config(

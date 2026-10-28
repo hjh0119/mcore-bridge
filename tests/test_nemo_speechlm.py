@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import pytest
 import subprocess
 import sys
-import pytest
 import torch
-from types import SimpleNamespace as NS
 from transformers import AutoConfig, PretrainedConfig
+from types import SimpleNamespace as NS
 
 from mcore_bridge.config.parser import hf_to_mcore_config
 from mcore_bridge.model.mm_gpts import nemo_speechlm as speechlm
@@ -43,11 +43,7 @@ def _config():
 
 
 def _enable_mtp(config):
-    config.mtp = NS(
-        enabled=True,
-        num_nextn_predict_layers=2,
-        use_repeated_layer=True,
-        hybrid_override_pattern='*E')
+    config.mtp = NS(enabled=True, num_nextn_predict_layers=2, use_repeated_layer=True, hybrid_override_pattern='*E')
     return config
 
 
@@ -81,8 +77,8 @@ def test_mtp_auto_detection_for_repeated_hybrid(monkeypatch):
         'llm.mtp.layers.1.final_layernorm.weight',
     ]
     monkeypatch.setattr(mtp_detect, '_read_weight_keys', lambda _: keys)
-    result = mtp_detect.resolve_mtp_config(
-        MODEL_MAPPING['nemo_speechlm'], _enable_mtp(_config()), 'unused', 'auto', None)
+    result = mtp_detect.resolve_mtp_config(MODEL_MAPPING['nemo_speechlm'], _enable_mtp(_config()), 'unused', 'auto',
+                                           None)
     assert result == (2, True)
 
 
@@ -258,6 +254,7 @@ def _export(config, model):
 
 def test_tiny_model_nemo_roundtrip_and_audio_backward():
     from test_glm5_next import _parallel_context
+
     from mcore_bridge.model.register import get_mcore_model
 
     with _parallel_context():
@@ -297,6 +294,7 @@ def test_tiny_model_nemo_roundtrip_and_audio_backward():
 def test_tiny_repeated_mtp_roundtrip_and_backward():
     from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
     from test_glm5_next import _parallel_context
+
     from mcore_bridge.model.register import get_mcore_model
 
     destroy_moe_metrics_tracker()
@@ -364,10 +362,10 @@ def test_full_export_preserves_source_only_weights(tmp_path):
             torch.testing.assert_close(result[key], source[key])
 
 
-def _parallel_roundtrip(tp=1, pp=1, ep=1, sequence_parallel=False):
+def _parallel_roundtrip(tp=1, pp=1, ep=1, sequence_parallel=False, mtp=False):
     from mcore_bridge.model.register import get_mcore_model
 
-    model, config = _build_tiny_model(tp=tp, pp=pp, ep=ep, sequence_parallel=sequence_parallel)
+    model, config = _build_tiny_model(tp=tp, pp=pp, ep=ep, sequence_parallel=sequence_parallel, mtp=mtp)
     exported = _export(config, model)
     assert exported['llm.model.embed_tokens.weight'].shape == (32, 16)
     assert exported['llm.lm_head.weight'].shape == (32, 16)
@@ -386,13 +384,16 @@ def test_nemo_speechlm_tp2_sp_roundtrip_forward_backward():
         pytest.skip('run with NEMO_SPEECHLM_PARALLEL_TEST=tp2 torchrun --nproc-per-node=2')
     from test_glm5_next import _parallel_context
 
+    mtp = os.environ.get('NEMO_SPEECHLM_MTP') == '1'
     with _parallel_context(tp=2):
-        model, config = _parallel_roundtrip(tp=2, sequence_parallel=True)
+        model, config = _parallel_roundtrip(tp=2, sequence_parallel=True, mtp=mtp)
         _attach_visual(model, config)
         logits = _test_logits(model, requires_grad=True)
         assert logits.shape == (1, 6, 32)
         logits.sum().backward()
         assert model.visual.perception.scale.grad is not None
+        if mtp:
+            assert any(p.grad is not None for p in model.language_model.mtp.parameters())
 
 
 def test_nemo_speechlm_ep2_roundtrip_forward_backward():
@@ -400,13 +401,16 @@ def test_nemo_speechlm_ep2_roundtrip_forward_backward():
         pytest.skip('run with NEMO_SPEECHLM_PARALLEL_TEST=ep2 torchrun --nproc-per-node=2')
     from test_glm5_next import _parallel_context
 
+    mtp = os.environ.get('NEMO_SPEECHLM_MTP') == '1'
     with _parallel_context(ep=2):
-        model, config = _parallel_roundtrip(ep=2)
+        model, config = _parallel_roundtrip(ep=2, mtp=mtp)
         _attach_visual(model, config)
         logits = _test_logits(model, requires_grad=True)
         assert logits.shape == (1, 6, 32)
         logits.sum().backward()
         assert model.visual.perception.scale.grad is not None
+        if mtp:
+            assert any(p.grad is not None for p in model.language_model.mtp.parameters())
 
 
 def test_nemo_speechlm_pp2_roundtrip_forward_backward():
@@ -416,8 +420,9 @@ def test_nemo_speechlm_pp2_roundtrip_forward_backward():
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
     from test_glm5_next import _parallel_context
 
+    mtp = os.environ.get('NEMO_SPEECHLM_MTP') == '1'
     with _parallel_context(pp=2):
-        model, config = _parallel_roundtrip(pp=2)
+        model, config = _parallel_roundtrip(pp=2, mtp=mtp)
         if model.pre_process:
             _attach_visual(model, config)
         else:
@@ -454,6 +459,8 @@ def test_nemo_speechlm_pp2_roundtrip_forward_backward():
         )
         if parallel_state.is_pipeline_last_stage():
             assert len(losses) == 1 and torch.isfinite(losses[0]['loss'])
+            if mtp:
+                assert any(p.grad is not None for p in model.language_model.mtp.parameters())
         assert any(parameter.grad is not None for parameter in model.parameters() if parameter.requires_grad)
         if model.pre_process:
             assert model.visual.perception.scale.grad is not None
