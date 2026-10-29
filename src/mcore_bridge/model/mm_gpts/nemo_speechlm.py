@@ -1,12 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""NeMo SpeechLM with a replicated audio tower and a Nemotron-H backbone."""
+"""Nemotron Transcribe with a replicated audio tower and a Nemotron-H backbone."""
 import os
 import re
 import torch
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from transformers import PretrainedConfig
-from types import SimpleNamespace
 from typing import Optional
 
 from mcore_bridge.config import ModelConfig
@@ -21,14 +20,6 @@ from .utils import HuggingFaceVit
 
 def _load_nemo_expert(weight, expert_idx):
     return weight.load_slice((expert_idx, )).transpose(0, 1)
-
-
-def _pad_runtime_vocab(weight, target_size):
-    tensor = weight.load()
-    if tensor.shape[0] < target_size:
-        padding = tensor.new_zeros((target_size - tensor.shape[0], *tensor.shape[1:]))
-        tensor = torch.cat([tensor, padding])
-    return tensor
 
 
 @dataclass
@@ -69,14 +60,6 @@ class NemoSpeechLMBridge(NemotronHBridge):
             result[key] = value
         return result
 
-    def _set_state_dict(self, mg_module, mg_key, hf_state_dict, hf_key, to_mcore, *, offset=0, is_expert=False):
-        if to_mcore and not self._peft_format and hf_key in {self.hf_embed_key, self.hf_lm_head_key}:
-            hf_state_dict = hf_state_dict.copy()
-            hf_state_dict[hf_key] = LazyTensor(
-                loader=partial(_pad_runtime_vocab, hf_state_dict[hf_key], self.config.padded_vocab_size))
-        return super()._set_state_dict(
-            mg_module, mg_key, hf_state_dict, hf_key, to_mcore, offset=offset, is_expert=is_expert)
-
     def _set_mlp_state(self,
                        mg_mlp,
                        hf_state_dict,
@@ -104,13 +87,19 @@ class NemoSpeechLMBridge(NemotronHBridge):
         for hf_name, nemo_name in [('up_proj', 'gate_and_up_projs'), ('down_proj', 'down_projs')]:
             pattern = re.compile(rf'^(.*)\.(\d+)\.{hf_name}\.weight$')
             weights = {}
+            prefixes = set()
             for key in list(hf_state_dict):
                 match = pattern.match(key)
                 if match:
                     weights[int(match.group(2))] = hf_state_dict.pop(key)
-                    prefix = match.group(1)
+                    prefixes.add(match.group(1))
             if weights:
-                assert len(weights) == self.config.num_moe_experts
+                if len(prefixes) != 1:
+                    raise ValueError(f'MoE {hf_name} spans multiple experts prefixes: {sorted(prefixes)}')
+                if len(weights) != self.config.num_moe_experts:
+                    raise ValueError(f'MoE {hf_name} has {len(weights)} experts, expected '
+                                     f'{self.config.num_moe_experts}')
+                prefix = prefixes.pop()
                 if prefix.endswith('.experts'):
                     prefix = prefix[:-len('.experts')]
                 hf_state_dict[f'{prefix}.experts.{nemo_name}'] = torch.stack(
@@ -135,22 +124,135 @@ class NemoSpeechLMBridge(NemotronHBridge):
         incompatible = mg_module.load_state_dict(state, strict=False)
         missing = [key for key in incompatible.missing_keys if not key.endswith('._extra_state')]
         unexpected = [key for key in incompatible.unexpected_keys if not key.endswith('._extra_state')]
-        assert not missing and not unexpected, (
-            f'Perception checkpoint mismatch: missing={missing}, unexpected={unexpected}')
+        if missing or unexpected:
+            raise ValueError(f'Perception checkpoint mismatch: missing={missing}, unexpected={unexpected}')
         return {}
 
     def get_hf_meta_model(self):
-        return SimpleNamespace(_auto_class=None)
+        hf_config = self.config.hf_config
+        if not hasattr(hf_config, 'audio_config'):
+            raise ValueError('Nemotron Transcribe requires a newer Transformers version (>5.21) and '
+                             'checkpoint metadata with audio_config; legacy NeMo metadata is not supported.')
+        from transformers import AutoModelForMultimodalLM
+        with torch.device('meta'):
+            return AutoModelForMultimodalLM.from_config(hf_config)
 
     def save_weights(self, mg_models, output_dir, peft_format=False, save_missing_weights=False, **kwargs):
         if not peft_format:
-            source_model_dir = save_missing_weights if isinstance(save_missing_weights, str) else self._source_model_dir
+            source_model_dir = (
+                save_missing_weights if isinstance(save_missing_weights, str) else self._source_model_dir)
             if source_model_dir is None or not os.path.isdir(source_model_dir):
-                raise ValueError('Exporting a complete NeMo SpeechLM checkpoint requires the source checkpoint to '
-                                 'preserve MTP, CTC and _extra_state weights. Pass the original --model directory.')
-            save_missing_weights = save_missing_weights or True
+                raise ValueError(
+                    'Exporting a complete Nemotron Transcribe checkpoint requires the source checkpoint to '
+                    'preserve MTP, CTC and _extra_state weights. Pass the original --model directory.')
+            save_missing_weights = True
         return super().save_weights(
             mg_models, output_dir, peft_format=peft_format, save_missing_weights=save_missing_weights, **kwargs)
+
+
+@lru_cache(maxsize=1)
+def _perception_transforms():
+    from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+    from transformers.core_model_loading import WeightConverter, WeightRenaming
+
+    transforms = get_checkpoint_conversion_mapping('nemo_speechlm')
+    if not transforms:
+        raise ImportError('Nemotron Transcribe requires a newer Transformers version (>5.21) with the '
+                          'nemo_speechlm checkpoint conversion mapping.')
+    renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
+    converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
+    if len(renamings) + len(converters) != len(transforms):
+        raise ValueError('Unsupported Nemotron Transcribe checkpoint transforms.')
+    return (renamings, converters, [transform.reverse_transform() for transform in renamings],
+            [transform.reverse_transform() for transform in converters])
+
+
+def _strip_perception_target(key):
+    if key.startswith('model.audio_tower.'):
+        return 'encoder.' + key[len('model.audio_tower.'):]
+    if key.startswith('model.multi_modal_projector.'):
+        return 'proj.' + key[len('model.multi_modal_projector.'):]
+    return None
+
+
+def _convert_perception_state(state):
+    from transformers.core_model_loading import rename_source_key
+
+    renamings, converters, _, _ = _perception_transforms()
+    out = {}
+    for key, tensor in state.items():
+        source = key if key.startswith('perception.') else f'perception.{key}'
+        target, pattern = rename_source_key(source, renamings, converters)
+        if pattern is not None and 'w_qkv' in pattern:
+            base = target.rsplit('self_attn.q_proj.weight', 1)[0]
+            for part, value in zip(('q', 'k', 'v'), tensor.chunk(3, dim=0), strict=True):
+                mapped = _strip_perception_target(f'{base}self_attn.{part}_proj.weight')
+                if mapped is not None:
+                    out[mapped] = value
+            continue
+        mapped = _strip_perception_target(target)
+        if mapped is not None:
+            out[mapped] = tensor
+    return out
+
+
+def _convert_perception_state_inverse(state):
+    from transformers.core_model_loading import rename_source_key
+
+    _, _, renamings, converters = _perception_transforms()
+    out, qkv, seen = {}, {}, set()
+    for key, tensor in state.items():
+        if key.startswith('proj.'):
+            source = f'model.multi_modal_projector.{key[len("proj."):]}'
+        elif key.startswith('encoder.'):
+            source = f'model.audio_tower.{key[len("encoder."):]}'
+        else:
+            continue
+        source, pattern = rename_source_key(source, renamings, converters, reverse=True)
+        if not source.startswith('perception.'):
+            continue
+        source = source[len('perception.'):]
+        seen.add(key)
+        if pattern is not None:
+            match = re.search(r'([qkv])_proj', pattern)
+            if match is not None:
+                if not source.endswith('attn.w_qkv.weight'):
+                    raise ValueError(f'Unexpected qkv mapping target: {source}')
+                base = source.rsplit('attn.w_qkv.weight', 1)[0]
+                qkv.setdefault(base, {})[match.group(1)] = tensor
+                continue
+        out[source] = tensor
+    for base, values in qkv.items():
+        out[f'{base}attn.w_qkv.weight'] = torch.cat([values['q'], values['k'], values['v']], dim=0)
+    unmapped = [key for key in state if not key.endswith('_extra_state') and key not in seen]
+    if unmapped:
+        raise ValueError(f'Perception keys not mapped back to checkpoint names: {unmapped[:8]}')
+    return out
+
+
+class _TransformersPerception(torch.nn.Module):
+
+    def __init__(self, hf_config):
+        super().__init__()
+        from transformers import Nemotron3_5TranscribeAudioModel
+        self.encoder = Nemotron3_5TranscribeAudioModel._from_config(hf_config.audio_config)
+        self.proj = torch.nn.Linear(hf_config.audio_config.hidden_size, hf_config.text_config.hidden_size)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        return super().load_state_dict(_convert_perception_state(state_dict), strict=strict, assign=assign)
+
+    def state_dict(self, *args, **kwargs):
+        return _convert_perception_state_inverse(super().state_dict(*args, **kwargs))
+
+    def get_audio_features(self, input_features, input_features_mask):
+        output = self.encoder(input_features, input_features_mask=input_features_mask, return_dict=True)
+        audio_embeds = self.proj(output.last_hidden_state)
+        lengths = input_features_mask.sum(-1).to(torch.long)
+        # Same factor as processor.subsampling_factor / the template's token estimate.
+        subsampling_factor = self.encoder.config.subsampling_factor
+        post_lengths = (lengths + subsampling_factor - 1) // subsampling_factor
+        valid_mask = torch.arange(audio_embeds.shape[1], device=post_lengths.device)[None, :] < post_lengths[:, None]
+        return audio_embeds[valid_mask]
 
 
 class NemoSpeechLMVit(HuggingFaceVit):
@@ -160,40 +262,20 @@ class NemoSpeechLMVit(HuggingFaceVit):
     test_mm_type = 'audio'
 
     def prepare_model(self, hf_config: PretrainedConfig):
-        from nemo.collections.asr.modules.parallel_expert_encoder import ParallelExpertEncoderPT
-        from nemo.collections.speechlm2.modules import AudioPerceptionModule
-        from omegaconf import DictConfig
-
-        self.perception = AudioPerceptionModule(DictConfig(hf_config.perception))
-        self.perception.encoder = ParallelExpertEncoderPT.from_inline_config(
-            hf_config.pe_encoder_config, map_location='cpu')
-        self.perception.encoder.chunk_size_seconds = hf_config.encoder_chunk_size_seconds
-        self.perception.encoder.online_inference_enabled = False
-        self.perception.encoder.spk_kernel_scale = hf_config.spk_kernel_scale
-        self.perception.preprocessor.featurizer.normalize = None
-        self.perception.preprocessor.requires_grad_(False)
+        self.perception = _TransformersPerception(hf_config)
         self.audio_token_id = hf_config.audio_token_id
-
-    def _encode_audio(self, audio_signal, audio_signal_length, device):
-        if isinstance(audio_signal, (list, tuple)):
-            max_length = max(audio.shape[-1] for audio in audio_signal)
-            audio_signal = torch.stack(
-                [torch.nn.functional.pad(audio, (0, max_length - audio.shape[-1])) for audio in audio_signal])
-        audio_signal = audio_signal.to(device=device, dtype=torch.float32)
-        audio_signal_length = audio_signal_length.to(device=device)
-        embeddings, lengths = self.perception(input_signal=audio_signal, input_signal_length=audio_signal_length)
-        return torch.cat([embedding[:length] for embedding, length in zip(embeddings, lengths)])
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         input_ids = kwargs['input_ids']
-        audio_signal = kwargs.get('audio_signal')
-        is_dummy = audio_signal is None
+        input_features = kwargs.get('input_features')
+        input_features_mask = kwargs.get('input_features_mask')
+        is_dummy = input_features is None
         if is_dummy:
-            audio_signal = inputs_embeds.new_zeros((1, 16000), dtype=torch.float32)
-            audio_signal_length = input_ids.new_tensor([audio_signal.shape[-1]])
-        else:
-            audio_signal_length = kwargs['audio_signal_length']
-        audio_embeds = self._encode_audio(audio_signal, audio_signal_length, inputs_embeds.device)
+            # 104 frames = 13 subsampled frames; must be a multiple of subsampling_factor.
+            num_mel_bins = int(self.config.hf_config.audio_config.asr_config.num_mel_bins)
+            input_features = inputs_embeds.new_zeros((1, 104, num_mel_bins), dtype=torch.float32)
+            input_features_mask = input_ids.new_ones((1, 104), dtype=torch.bool)
+        audio_embeds = self.perception.get_audio_features(input_features, input_features_mask)
         if is_dummy:
             return inputs_embeds + audio_embeds.mean().to(inputs_embeds.dtype) * 0.
         audio_mask = input_ids == self.audio_token_id
@@ -224,16 +306,16 @@ class NemoSpeechLMLoader(NemotronHLoader):
 
     def __init__(self, config):
         if not _HYBRID_MODEL_AVAILABLE:
-            raise ImportError('NeMo SpeechLM requires megatron-core with models.hybrid support.')
+            raise ImportError('Nemotron Transcribe requires megatron-core with models.hybrid support.')
         if config.context_parallel_size > 1:
-            raise NotImplementedError('NeMo SpeechLM requires --context_parallel_size 1.')
+            raise NotImplementedError('Nemotron Transcribe requires --context_parallel_size 1.')
         if config.mtp_num_layers and not getattr(config, 'mtp_use_repeated_layer', False):
-            raise NotImplementedError('NeMo SpeechLM MTP has one physical repeated pattern; '
-                                      'use --mtp_shared_weights true or --mtp_num_layers 1.')
+            raise NotImplementedError('Nemotron Transcribe MTP uses one repeated physical pattern; '
+                                      'use --mtp_shared_weights true.')
         if config.fp8 or getattr(config, 'fp4', None):
-            raise NotImplementedError('NeMo SpeechLM FP8/FP4 training is not supported.')
+            raise NotImplementedError('Nemotron Transcribe FP8/FP4 training is not supported.')
         if getattr(config, 'padding_free', False) or getattr(config, 'packing', False):
-            raise NotImplementedError('NeMo SpeechLM requires --padding_free false --packing false.')
+            raise NotImplementedError('Nemotron Transcribe requires --padding_free false --packing false.')
         super().__init__(config)
 
 

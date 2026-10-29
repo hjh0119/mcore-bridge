@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import copy
 import os
 import pytest
 import subprocess
@@ -11,6 +12,12 @@ from mcore_bridge.config.parser import hf_to_mcore_config
 from mcore_bridge.model.mm_gpts import nemo_speechlm as speechlm
 from mcore_bridge.model.register import MODEL_MAPPING
 from mcore_bridge.utils.safetensors import LazyTensor
+
+try:
+    from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+    _HAS_NEMO_CONVERSION = bool(get_checkpoint_conversion_mapping('nemo_speechlm'))
+except (ImportError, KeyError):
+    _HAS_NEMO_CONVERSION = False
 
 
 def _config():
@@ -36,8 +43,8 @@ def _config():
     )
     config = PretrainedConfig()
     config.model_type = 'nemo_speechlm'
-    config.llm_config = llm
-    config.speechlm_output_vocab_size = llm.vocab_size
+    config.text_config = llm
+    config.audio_token_id = llm.vocab_size
     config.aux_loss_coeff = 1e-4
     return config
 
@@ -82,20 +89,13 @@ def test_mtp_auto_detection_for_repeated_hybrid(monkeypatch):
     assert result == (2, True)
 
 
-def test_runtime_vocab_padding():
-    source = LazyTensor(tensor=torch.arange(24.).view(4, 6))
-    result = speechlm._pad_runtime_vocab(source, 6)
-    assert result.shape == (6, 6)
-    torch.testing.assert_close(result[:4], source.tensor)
-    assert result[4:].count_nonzero() == 0
-
-
 def test_runtime_vocab_differs_from_checkpoint_vocab():
     from test_glm5_next import _parallel_context
 
     hf_config = _config()
-    hf_config.llm_config.vocab_size = 33
-    hf_config.speechlm_output_vocab_size = 32
+    hf_config.text_config = copy.deepcopy(hf_config.text_config)
+    hf_config.text_config.vocab_size = 32
+    hf_config.audio_token_id = 32
     values = hf_to_mcore_config(hf_config)
     values.update(params_dtype=torch.float32, pipeline_dtype=torch.float32)
     with _parallel_context():
@@ -128,12 +128,14 @@ class _Perception(torch.nn.Module):
         self.hidden_size = hidden_size
         self.scale = torch.nn.Parameter(torch.tensor(2.))
 
-    def forward(self, input_signal, input_signal_length):
-        embeddings = [
-            self.scale * input_signal.new_ones((length, self.hidden_size), dtype=self.scale.dtype)
-            for length in input_signal_length.tolist()
-        ]
-        return embeddings, input_signal_length
+    def get_audio_features(self, input_features, input_features_mask):
+        subsampling_factor = 8
+        frames = input_features_mask.sum(-1).to(torch.long)
+        lengths = ((frames + subsampling_factor - 1) // subsampling_factor).tolist()
+        return torch.cat([
+            self.scale * input_features.new_ones((length, self.hidden_size), dtype=self.scale.dtype)
+            for length in lengths
+        ])
 
 
 def _visual(hidden_size=3, audio_token_id=9):
@@ -141,20 +143,22 @@ def _visual(hidden_size=3, audio_token_id=9):
     torch.nn.Module.__init__(visual)
     visual.perception = _Perception(hidden_size)
     visual.audio_token_id = audio_token_id
+    visual.config = NS(hf_config=NS(audio_config=NS(asr_config=NS(num_mel_bins=128))))
     return visual
 
 
 def test_audio_scatter_and_gradient():
     visual = _visual()
-    inputs_embeds = torch.zeros(1, 5, 3, requires_grad=True)
-    input_ids = torch.tensor([[1, 9, 9, 9, 2]])
+    inputs_embeds = torch.zeros(1, 15, 3, requires_grad=True)
+    input_ids = torch.tensor([[1] + [9] * 13 + [2]])
     result = visual.get_inputs_embeds(
         inputs_embeds,
         input_ids=input_ids,
-        audio_signal=torch.zeros(1, 160, dtype=torch.float32),
-        audio_signal_length=torch.tensor([3]))
+        input_features=torch.zeros(1, 104, 128, dtype=torch.float32),
+        input_features_mask=torch.ones(1, 104, dtype=torch.bool))
     assert torch.equal(result[0, 0], torch.zeros(3))
-    assert torch.equal(result[0, 1:4], torch.full((3, 3), 2.))
+    assert torch.equal(result[0, 1:14], torch.full((13, 3), 2.))
+    assert torch.equal(result[0, 14], torch.zeros(3))
     result.sum().backward()
     assert visual.perception.scale.grad is not None
     assert visual.perception.scale.grad != 0
@@ -175,8 +179,8 @@ def test_audio_shape_mismatch_fails():
         visual.get_inputs_embeds(
             torch.zeros(1, 2, 3),
             input_ids=torch.tensor([[9, 9]]),
-            audio_signal=torch.zeros(1, 160),
-            audio_signal_length=torch.tensor([3]))
+            input_features=torch.zeros(1, 3, 128),
+            input_features_mask=torch.ones(1, 3, dtype=torch.bool))
 
 
 @pytest.mark.parametrize('changes,match', [
@@ -185,7 +189,7 @@ def test_audio_shape_mismatch_fails():
     }, 'context_parallel_size 1'),
     ({
         'mtp_num_layers': 1
-    }, 'one physical repeated pattern'),
+    }, 'repeated physical pattern'),
     ({
         'fp8': 'hybrid'
     }, 'FP8/FP4'),
@@ -199,6 +203,23 @@ def test_loader_guards(changes, match):
         setattr(config, key, value)
     with pytest.raises(NotImplementedError, match=match):
         speechlm.NemoSpeechLMLoader(config)
+
+
+def test_prepare_model_uses_transformers_perception(monkeypatch):
+    visual = speechlm.NemoSpeechLMVit.__new__(speechlm.NemoSpeechLMVit)
+    torch.nn.Module.__init__(visual)
+    perception = object()
+    monkeypatch.setattr(speechlm, '_TransformersPerception', lambda _: perception)
+    visual.prepare_model(NS(audio_token_id=7))
+    assert visual.perception is perception
+    assert visual.audio_token_id == 7
+
+
+def test_get_hf_meta_model_rejects_legacy_metadata():
+    bridge = speechlm.NemoSpeechLMBridge.__new__(speechlm.NemoSpeechLMBridge)
+    bridge.config = NS(hf_config=PretrainedConfig())
+    with pytest.raises(ValueError, match='legacy NeMo metadata'):
+        bridge.get_hf_meta_model()
 
 
 def test_full_export_requires_source_checkpoint(tmp_path):
@@ -219,8 +240,8 @@ def _build_tiny_model(tp=1, pp=1, ep=1, sequence_parallel=False, mtp=False):
         _enable_mtp(hf_config)
     hf_config.audio_token_id = 31
     if pp > 1:
-        hf_config.llm_config.num_hidden_layers = 4
-        hf_config.llm_config.layers_block_type.append('full_attention')
+        hf_config.text_config.num_hidden_layers = 4
+        hf_config.text_config.layers_block_type.append('full_attention')
     values = hf_to_mcore_config(hf_config)
     values.update(
         language_model_only=True,
@@ -276,16 +297,16 @@ def test_tiny_model_nemo_roundtrip_and_audio_backward():
 
         model.config.language_model_only = False
         model.visual = _visual(hidden_size=16, audio_token_id=31).cuda()
-        input_ids = torch.tensor([[1, 31, 31, 31, 2, 2]], device='cuda')
-        position_ids = torch.arange(6, device='cuda').unsqueeze(0)
-        attention_mask = torch.triu(torch.ones(1, 1, 6, 6, device='cuda', dtype=torch.bool), diagonal=1)
+        input_ids = torch.tensor([[1] + [31] * 13 + [2, 2]], device='cuda')
+        position_ids = torch.arange(16, device='cuda').unsqueeze(0)
+        attention_mask = torch.triu(torch.ones(1, 1, 16, 16, device='cuda', dtype=torch.bool), diagonal=1)
         logits = model(
             input_ids,
             position_ids,
             attention_mask,
-            audio_signal=torch.zeros(1, 240, device='cuda'),
-            audio_signal_length=torch.tensor([3], device='cuda'))
-        assert logits.shape == (1, 6, config.padded_vocab_size)
+            input_features=torch.zeros(1, 104, 128, device='cuda'),
+            input_features_mask=torch.ones(1, 104, dtype=torch.bool, device='cuda'))
+        assert logits.shape == (1, 16, config.padded_vocab_size)
         logits.sum().backward()
         assert model.visual.perception.scale.grad is not None
         assert model.visual.perception.scale.grad != 0
@@ -331,7 +352,7 @@ def test_perception_import_is_strict():
     bridge = speechlm.NemoSpeechLMBridge.__new__(speechlm.NemoSpeechLMBridge)
     bridge._peft_format = False
     module = _Perception()
-    with pytest.raises(AssertionError, match='Perception checkpoint mismatch'):
+    with pytest.raises(ValueError, match='Perception checkpoint mismatch'):
         bridge._set_module(module, {}, 'perception.', True)
     state = {
         'perception.scale': LazyTensor(tensor=torch.tensor(3.)),
@@ -339,6 +360,66 @@ def test_perception_import_is_strict():
     }
     assert bridge._set_module(module, state, 'perception.', True) == {}
     assert module.scale.item() == 3
+
+
+def test_pack_nemo_experts_rejects_cross_layer_prefixes():
+    bridge = speechlm.NemoSpeechLMBridge.__new__(speechlm.NemoSpeechLMBridge)
+    bridge.config = NS(num_moe_experts=2)
+    state = {
+        'a.experts.0.up_proj.weight': torch.zeros(2, 2),
+        'a.experts.1.up_proj.weight': torch.zeros(2, 2),
+        'b.experts.0.up_proj.weight': torch.zeros(2, 2),
+        'b.experts.1.up_proj.weight': torch.zeros(2, 2),
+    }
+    with pytest.raises(ValueError, match='multiple experts prefixes'):
+        bridge._pack_nemo_experts(state)
+
+
+@pytest.mark.skipif(not _HAS_NEMO_CONVERSION, reason='requires Transformers nemo_speechlm conversion mapping')
+def test_transformers_perception_key_mapping():
+    state = {
+        'proj.weight': torch.zeros(3, 2),
+        'encoder.asr_encoder.layers.0.attn.w_qkv.weight': torch.zeros(6, 2, 2),
+        'encoder.asr_encoder.layers.0.attn.out_proj.weight': torch.zeros(2, 2),
+        'encoder.asr_encoder.layers.0.norm1.weight': torch.zeros(2),
+        'encoder.asr_encoder.layers.0.ffn.net.0.weight': torch.zeros(2, 2),
+        'encoder.asr_encoder.layers.0.ffn.net.3.weight': torch.zeros(2, 2),
+        'encoder.asr_encoder.pre_encode.proj.weight': torch.zeros(2, 2),
+        'encoder.asr_norm.weight': torch.zeros(2),
+        'encoder.diar_norm.weight': torch.zeros(2),
+        'encoder.diarization_model.encoder.layers.0.attn.w_qkv.weight': torch.zeros(6, 2, 2),
+        'encoder.diarization_model.sortformer_modules.encoder_proj.weight': torch.zeros(2, 2),
+        'encoder.diarization_model.sortformer_modules.subpixel_upsample.weight': torch.zeros(2),
+        'encoder.diarization_model.sortformer_modules.first_hidden_to_hidden.weight': torch.zeros(2, 2),
+        'encoder.diarization_model.sortformer_modules.single_hidden_to_spks.weight': torch.zeros(2, 2),
+        'encoder.diarization_model.sortformer_modules.learnable_sil_emb': torch.zeros(2),
+        'encoder.diarization_model.sortformer_modules.hidden_to_spks.weight': torch.zeros(1, 2),
+    }
+    mapped = speechlm._convert_perception_state(state)
+    assert 'encoder.asr_encoder.layers.0.self_attn.q_proj.weight' in mapped
+    assert 'encoder.diarization_model.model.upsampler.conv.weight' in mapped
+    assert 'encoder.diarization_model.silence_embeds' in mapped
+    assert 'encoder.diarization_model.sortformer_modules.hidden_to_spks.weight' not in mapped
+    inverse = speechlm._convert_perception_state_inverse(mapped)
+    expected = set(state) - {'encoder.diarization_model.sortformer_modules.hidden_to_spks.weight'}
+    assert set(inverse) == expected
+    torch.testing.assert_close(inverse['encoder.asr_encoder.layers.0.attn.w_qkv.weight'],
+                               state['encoder.asr_encoder.layers.0.attn.w_qkv.weight'])
+
+
+@pytest.mark.skipif(not _HAS_NEMO_CONVERSION, reason='requires Transformers nemo_speechlm conversion mapping')
+def test_inverse_perception_rejects_unmapped_key():
+    with pytest.raises(ValueError, match='not mapped back'):
+        speechlm._convert_perception_state_inverse({'unknown.weight': torch.zeros(1)})
+
+
+@pytest.mark.skipif(not _HAS_NEMO_CONVERSION, reason='requires Transformers nemo_speechlm conversion mapping')
+def test_inverse_perception_rejects_non_perception_target(monkeypatch):
+    import transformers.core_model_loading as core_model_loading
+
+    monkeypatch.setattr(core_model_loading, 'rename_source_key', lambda *args, **kwargs: ('not_perception', None))
+    with pytest.raises(ValueError, match='not mapped back'):
+        speechlm._convert_perception_state_inverse({'encoder.unknown.weight': torch.zeros(1)})
 
 
 def test_full_export_preserves_source_only_weights(tmp_path):
@@ -427,10 +508,10 @@ def test_nemo_speechlm_pp2_roundtrip_forward_backward():
             _attach_visual(model, config)
         else:
             config.language_model_only = False
-        input_ids = torch.tensor([[1, 31, 31, 31, 2, 2]], device='cuda')
-        position_ids = torch.arange(6, device='cuda').unsqueeze(0)
-        attention_mask = torch.triu(torch.ones(1, 1, 6, 6, device='cuda', dtype=torch.bool), diagonal=1)
-        labels = torch.tensor([[1, 2, 3, 4, 5, 6]], device='cuda')
+        input_ids = torch.tensor([[1] + [31] * 13 + [2, 2]], device='cuda')
+        position_ids = torch.arange(16, device='cuda').unsqueeze(0)
+        attention_mask = torch.triu(torch.ones(1, 1, 16, 16, device='cuda', dtype=torch.bool), diagonal=1)
+        labels = torch.arange(1, 17, device='cuda').unsqueeze(0)
 
         def forward_step(data_iterator, stage_model):
             ids, positions, mask, target = next(data_iterator)
@@ -439,8 +520,8 @@ def test_nemo_speechlm_pp2_roundtrip_forward_backward():
                 positions,
                 mask,
                 labels=target,
-                audio_signal=torch.zeros(1, 240, device='cuda'),
-                audio_signal_length=torch.tensor([3], device='cuda'))
+                input_features=torch.zeros(1, 104, 128, device='cuda'),
+                input_features_mask=torch.ones(1, 104, dtype=torch.bool, device='cuda'))
 
             def loss_func(tensor):
                 loss = tensor.float().mean()
@@ -453,7 +534,7 @@ def test_nemo_speechlm_pp2_roundtrip_forward_backward():
             data_iterator=iter([(input_ids, position_ids, attention_mask, labels)]),
             model=[model],
             num_microbatches=1,
-            seq_length=6,
+            seq_length=16,
             micro_batch_size=1,
             forward_only=False,
         )
@@ -484,16 +565,16 @@ def _wrap_lora(model):
 
 def _test_logits(model, requires_grad=False):
     model.eval()
-    input_ids = torch.tensor([[1, 31, 31, 31, 2, 2]], device='cuda')
-    position_ids = torch.arange(6, device='cuda').unsqueeze(0)
-    attention_mask = torch.triu(torch.ones(1, 1, 6, 6, device='cuda', dtype=torch.bool), diagonal=1)
+    input_ids = torch.tensor([[1] + [31] * 13 + [2, 2]], device='cuda')
+    position_ids = torch.arange(16, device='cuda').unsqueeze(0)
+    attention_mask = torch.triu(torch.ones(1, 1, 16, 16, device='cuda', dtype=torch.bool), diagonal=1)
     with torch.set_grad_enabled(requires_grad):
         logits = model(
             input_ids,
             position_ids,
             attention_mask,
-            audio_signal=torch.zeros(1, 240, device='cuda'),
-            audio_signal_length=torch.tensor([3], device='cuda'),
+            input_features=torch.zeros(1, 104, 128, device='cuda'),
+            input_features_mask=torch.ones(1, 104, dtype=torch.bool, device='cuda'),
             runtime_gather_output=True)
     return logits[..., :model.config.actual_vocab_size].cpu()
 

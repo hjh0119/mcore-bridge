@@ -202,19 +202,12 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
     res['llm_model_type'] = llm_model_type
     if hf_model_type == 'nemo_speechlm':
         if not res.get('hybrid_layer_pattern'):
-            symbols = {
-                'mamba': 'M',
-                'linear_attention': 'M',
-                'moe': 'E',
-                'attention': '*',
-                'full_attention': '*',
-                'mlp': '-'
-            }
-            block_types = hf_config.llm_config.layers_block_type
-            res['hybrid_layer_pattern'] = ''.join(symbols[block_type] for block_type in block_types)
+            raise ValueError('Nemotron Transcribe requires text_config.hybrid_override_pattern.')
         res['num_layers'] = len(res['hybrid_layer_pattern'])
         res['moe_aux_loss_coeff'] = hf_config.aux_loss_coeff
-        res['actual_vocab_size'] = hf_config.speechlm_output_vocab_size
+        res['actual_vocab_size'] = hf_config.text_config.vocab_size
+        # The audio placeholder is appended after the text vocabulary and has no source embedding row.
+        res['padded_vocab_size'] = max(int(res.get('padded_vocab_size') or 0), int(hf_config.audio_token_id) + 1)
 
         mtp = getattr(hf_config, 'mtp', None) or {}
         get_mtp = mtp.get if isinstance(mtp, dict) else lambda key, default=None: getattr(mtp, key, default)
