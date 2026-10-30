@@ -26,7 +26,6 @@ logger = get_logger()
 #   SEMANTICS    deliberate bridge behavior kept for legacy parity; not a bug.
 #   UPSTREAM     workaround for an upstream defect; drop once upstream fixes it.
 
-
 # `process_mtp_loss` gained `tp_group`/`input_ids` in 0.19 and more on dev. The bridge's
 # single call site passes them unconditionally, so the accepted set is probed once here.
 _PROCESS_MTP_LOSS_PARAMS = tuple(inspect.signature(_upstream_process_mtp_loss).parameters)
