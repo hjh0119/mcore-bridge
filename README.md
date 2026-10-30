@@ -110,7 +110,7 @@ Recommended Runtime Environment:
 | torch        | >=2.0        | 2.8.0/2.11.0       |                    |
 | transformer-engine    | >=2.3       |  2.14.1    |                  |
 | apex |         | 0.1 | Optional |
-| megatron-core    |   >=0.18,<0.21    | 0.18.2      |                  |
+| megatron-core    |   >=0.18,<0.21    | 0.19.2      |                  |
 | flash-attn    |        | 2.8.3/3.0.0b1   |     Optional      |
 | transformers | >=4.33       | 4.57.6/5.8.1   |                    |
 | modelscope   | >=1.23       |             |                    |
