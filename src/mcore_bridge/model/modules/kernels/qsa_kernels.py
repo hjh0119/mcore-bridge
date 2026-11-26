@@ -272,9 +272,16 @@ class QSASparseCoreAttention(torch.nn.Module):
     gather's backward reduce-scatters dk/dv to the local shards.
     """
 
-    def __init__(self, core_attention, config, softmax_scale=None):
+    def __init__(self, core_attention, config, softmax_scale=None, kernel_enabled=True):
         super().__init__()
         self.core_attention = core_attention
+        # False: installed only to expose q/k to the indexer KL; the layer then never
+        # routes index selections here (QSA_SPARSE_KERNEL=0 or unsupported head dim).
+        self.kernel_enabled = kernel_enabled
+        # Set by the layer around one attention call when the indexer KL needs the
+        # teacher: receives the detached post-RoPE (query, key). Left None otherwise,
+        # including during a core_attn recompute, so nothing is captured twice.
+        self.capture_qk = None
         # None -> resolved to 1/sqrt(head_dim) at call time, matching TE.
         self.softmax_scale = softmax_scale
         self.config = config
@@ -295,6 +302,8 @@ class QSASparseCoreAttention(torch.nn.Module):
                 attention_bias=None,
                 packed_seq_params=None,
                 **kwargs):
+        if self.capture_qk is not None:
+            self.capture_qk.append((query.detach(), key.detach()))
         if attention_mask is not None and attention_mask.dtype in (torch.int32, torch.int64):
             scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1]**-0.5
             cp_size = self.config.context_parallel_size

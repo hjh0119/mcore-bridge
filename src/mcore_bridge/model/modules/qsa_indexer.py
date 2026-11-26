@@ -1,8 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 import torch
+from dataclasses import dataclass
 from megatron.core.extensions.transformer_engine import TELinear
 from torch import nn
+from typing import Optional
 
 # Byte budget for the transient score tile in packed and unpacked selection: the (token, block)
 # scoring is chunked over queries to avoid OOM from the full [T, n_heads, NB] fp32 tensor.
@@ -52,6 +54,36 @@ def _materialize_rope(freqs: torch.Tensor, seq_len: int, dtype: torch.dtype, msc
 def _stable_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     order = torch.sort(scores, dim=-1, descending=True, stable=True).indices
     return order[..., :k]
+
+
+def _apply_partial_rope(t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    rot = cos.shape[-1]
+    t_rope, t_pass = t[..., :rot], t[..., rot:]
+    t_rope = (t_rope * cos) + (_rotate_half(t_rope) * sin)
+    return torch.cat((t_rope, t_pass), dim=-1)
+
+
+@dataclass
+class QSALossInputs:
+    """Indexer-side inputs of the QSA indexer KL, in one flat pack space.
+
+    Every tensor uses the thd pack space; sbhd is flattened batch-major (token
+    ``t = sample * s + p``), so each sample is one document of length ``s``.
+
+    Attributes:
+        q: Differentiable index queries ``[T, n_heads, d]`` (normalized, rotated).
+        block_keys: Differentiable compressed keys ``[NB, d]`` of every complete
+            block, document-major (document ``i`` owns ``(len_i // R)`` rows).
+        cu_seqlens: ``[D+1]`` int64 document boundaries of the pack space.
+        top_blocks: Detached Stage-2 support ``[T, k]`` as pack-space block ids,
+            or ``None`` for the dense support (every visible complete block).
+        keep: ``[T, k]`` bool validity of ``top_blocks`` slots, or ``None``.
+    """
+    q: torch.Tensor
+    block_keys: torch.Tensor
+    cu_seqlens: torch.Tensor
+    top_blocks: Optional[torch.Tensor] = None
+    keep: Optional[torch.Tensor] = None
 
 
 @torch.no_grad()
@@ -153,44 +185,33 @@ class QSAIndexer(nn.Module):
             dtype=config.params_dtype,
             sequence_parallel=config.sequence_parallel)
         setattr(self.index_qk_proj.weight, 'sequence_parallel', config.sequence_parallel)
-        # QSA selection is non-differentiable and always runs without autograd.
-        # Keep its pretrained parameters out of optimizer groups and DDP buckets.
-        self.requires_grad_(False)
+        # Indexer KL training (tech report §2.1.2); 0 keeps the indexer frozen.
+        self.loss_coeff = float(config.dsa_indexer_loss_coeff or 0.0)
+        self.use_sparse_loss = bool(config.dsa_indexer_use_sparse_loss)
+        if self.loss_coeff > 0:
+            # Every TP rank sees the full sequence and computes the same KL, so the
+            # duplicated params must be averaged (not summed, which the SP and
+            # `q_layernorm`/`k_layernorm` name rules of finalize_model_grads would do).
+            for param in self.parameters():
+                setattr(param, 'average_gradients_across_tp_domain', True)
+        else:
+            # QSA selection is non-differentiable and always runs without autograd.
+            # Keep its pretrained parameters out of optimizer groups and DDP buckets.
+            self.requires_grad_(False)
 
     def forward(self, *args, **kwargs):
         raise RuntimeError('QSAIndexer selects via selection_as_mask / selection_as_token_indices / '
                            'select_token_indices_thd, not forward.')
 
-    @torch.no_grad()
-    def _score_and_topk_blocks(self, hidden_states: torch.Tensor, freqs: torch.Tensor):
-        """The selection itself: score every (query, block) pair and keep the top-k.
+    def _project_sbhd(self, hidden_states: torch.Tensor, freqs: torch.Tensor):
+        """``[s, b, h]`` -> index queries ``[b, s, nh, d]`` and complete-block keys ``[b, s // R, d]``.
 
-        Shared by ``selection_as_mask`` / ``selection_as_token_indices`` so both
-        encodings describe the same choice.
-
-        Args:
-            hidden_states: ``[s, b, h]`` (mcore layout), pre-attention input --
-                the same tensor the reference indexer consumes.
-            freqs: mcore rotary frequencies ``[s, freq_b, 1, rot_dim]``, where
-                ``freq_b`` is 1 for ordinary RoPE or ``b`` for batch-dependent
-                MRoPE. mcore stores angles rather than cos/sin, so they are
-                materialized here the way ``_patch_apply_rotary_pos_emb`` does
-                (``cos(freqs) * mscale``), keeping the indexer's RoPE identical
-                to the attention's.
-
-        Returns:
-            ``None`` when selection is a no-op (the causal prefix never exceeds
-            the budget), else ``(top_blocks, keep, n_blocks)`` where
-            ``top_blocks``/``keep`` are ``[b, s, k]`` (``k =
-            min(block_topk, max_blocks)``) and ``n_blocks`` is ``[s]``.
+        Differentiable when called with grad enabled; the selection calls it under
+        ``no_grad``, so both modes run the exact same ops.
         """
         s, b, _ = hidden_states.shape
         R = self.compress_ratio
         max_blocks = s // R
-        if max_blocks <= self.block_topk:
-            return None
-
-        device = hidden_states.device
         # ---- project to indexer q/k ----
         # [s, b, h] -> [s, b, (nh + nkv) * d]
         qk = self.index_qk_proj(hidden_states)[0]
@@ -206,15 +227,9 @@ class QSAIndexer(nn.Module):
         # (rope_utils.py:344), and _materialize_rope keeps it so it broadcasts.
         mscale = self.config.attention_scaling
         cos, sin = _materialize_rope(freqs, s, q.dtype, mscale)
-        rot = cos.shape[-1]
-
-        def apply_rope(t, cos_, sin_):
-            t_rope, t_pass = t[..., :rot], t[..., rot:]
-            t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
-            return torch.cat((t_rope, t_pass), dim=-1)
 
         # queries rotate at their own position: cos [bf, s, rot] -> [bf, s, 1, rot]
-        q = apply_rope(q, cos.unsqueeze(2), sin.unsqueeze(2))
+        q = _apply_partial_rope(q, cos.unsqueeze(2), sin.unsqueeze(2))
 
         # ---- pool every block once (shared across queries) ----
         usable = max_blocks * R
@@ -222,8 +237,43 @@ class QSAIndexer(nn.Module):
         pooled = key_groups.float().mean(dim=2).to(raw_keys.dtype)
         pooled = self.k_layernorm(pooled)
         # blocks rotate at their first token's position
-        starts = torch.arange(max_blocks, device=device) * R
-        block_keys = apply_rope(pooled, cos[:, starts], sin[:, starts])  # [b, nb, d]
+        starts = torch.arange(max_blocks, device=hidden_states.device) * R
+        block_keys = _apply_partial_rope(pooled, cos[:, starts], sin[:, starts])  # [b, nb, d]
+        return q, block_keys
+
+    @torch.no_grad()
+    def _score_and_topk_blocks(self, hidden_states: torch.Tensor, freqs: torch.Tensor, projected=None):
+        """The selection itself: score every (query, block) pair and keep the top-k.
+
+        Shared by ``selection_as_mask`` / ``selection_as_token_indices`` so both
+        encodings describe the same choice.
+
+        Args:
+            hidden_states: ``[s, b, h]`` (mcore layout), pre-attention input --
+                the same tensor the reference indexer consumes.
+            freqs: mcore rotary frequencies ``[s, freq_b, 1, rot_dim]``, where
+                ``freq_b`` is 1 for ordinary RoPE or ``b`` for batch-dependent
+                MRoPE. mcore stores angles rather than cos/sin, so they are
+                materialized here the way ``_patch_apply_rotary_pos_emb`` does
+                (``cos(freqs) * mscale``), keeping the indexer's RoPE identical
+                to the attention's.
+            projected: optional ``_project_sbhd`` output to reuse (the trainable
+                path projects once with grad and routes on that same result).
+
+        Returns:
+            ``None`` when selection is a no-op (the causal prefix never exceeds
+            the budget), else ``(top_blocks, keep, n_blocks)`` where
+            ``top_blocks``/``keep`` are ``[b, s, k]`` (``k =
+            min(block_topk, max_blocks)``) and ``n_blocks`` is ``[s]``.
+        """
+        s, b, _ = hidden_states.shape
+        R = self.compress_ratio
+        max_blocks = s // R
+        if max_blocks <= self.block_topk:
+            return None
+
+        device = hidden_states.device
+        q, block_keys = projected if projected is not None else self._project_sbhd(hidden_states, freqs)
 
         # Bound score workspace by queries, preserving all candidate blocks.
         chunk_size = max(1, min(s, _QSA_INDEX_SCORE_CHUNK_BYTES // max(1, b * self.index_n_heads * max_blocks * 4)))
@@ -244,27 +294,59 @@ class QSAIndexer(nn.Module):
             del scores, selected
         return top_blocks, keep, n_blocks
 
-    @torch.no_grad()
-    def selection_as_mask(self, hidden_states: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    def _sbhd_loss_inputs(self, projected, core, s: int, b: int) -> QSALossInputs:
+        """Flatten ``_project_sbhd`` output (and optionally its top-k) into the pack space."""
+        q, block_keys = projected
+        nb = s // self.compress_ratio
+        device = q.device
+        inputs = QSALossInputs(
+            q=q.reshape(b * s, self.index_n_heads, self.index_head_dim),
+            block_keys=block_keys.reshape(b * nb, self.index_head_dim),
+            cu_seqlens=torch.arange(b + 1, device=device, dtype=torch.long) * s)
+        if core is not None:
+            top_blocks, keep, _ = core
+            offset = torch.arange(b, device=device).view(b, 1, 1) * nb
+            inputs.top_blocks = (top_blocks + offset).reshape(b * s, -1)
+            inputs.keep = keep.reshape(b * s, -1)
+        return inputs
+
+    def project_loss_inputs_sbhd(self, hidden_states: torch.Tensor, freqs: torch.Tensor) -> QSALossInputs:
+        """Dense-support KL inputs (Stage-1 distillation): project once with grad, no top-k.
+
+        ``hidden_states`` is detached, so the KL trains only the indexer.
+        """
+        s, b, _ = hidden_states.shape
+        return self._sbhd_loss_inputs(self._project_sbhd(hidden_states.detach(), freqs), None, s, b)
+
+    def selection_as_mask(self, hidden_states: torch.Tensor, freqs: torch.Tensor, return_loss_inputs: bool = False):
         """Encode the selection as a bool mask, or ``None`` when it is a no-op.
 
         Returns:
             ``[b, 1, s, s]`` bool mask where True marks a *masked-out* key (TE's
             ``arbitrary`` convention), or ``None`` if every visible key is
             selected -- in which case the caller keeps the plain causal path and
-            pays nothing.
+            pays nothing. With ``return_loss_inputs`` the result is
+            ``(mask, QSALossInputs)``: one differentiable projection whose
+            detached view drives the routing, plus the top-k as the KL support
+            (``None`` support when the selection is a no-op, i.e. every visible
+            block is selected).
 
         Only the causal, unpacked layout is handled; callers must not invoke this
         for packed/THD or context-parallel inputs (see the guard in the layer).
         """
-        core = self._score_and_topk_blocks(hidden_states, freqs)
-        # when seq lengths less than budget
-        if core is None:
-            return None
-        top_blocks, keep, n_blocks = core
         s, b, _ = hidden_states.shape
+        projected = self._project_sbhd(hidden_states.detach(), freqs) if return_loss_inputs else None
+        with torch.no_grad():
+            core = self._score_and_topk_blocks(hidden_states, freqs, projected)
+            # when seq lengths less than budget
+            mask = None if core is None else self._encode_mask(core, s, b, hidden_states.device)
+        if return_loss_inputs:
+            return mask, self._sbhd_loss_inputs(projected, core, s, b)
+        return mask
+
+    def _encode_mask(self, core, s: int, b: int, device) -> torch.Tensor:
+        top_blocks, keep, n_blocks = core
         R = self.compress_ratio
-        device = hidden_states.device
 
         # ---- top-k blocks -> token mask ----
         tok = (top_blocks.unsqueeze(-1) * R + torch.arange(R, device=device)).flatten(-2)
@@ -283,8 +365,10 @@ class QSAIndexer(nn.Module):
         allowed &= (pos[None, :] <= pos[:, None])[None]
         return ~allowed.unsqueeze(1)  # True == masked out
 
-    @torch.no_grad()
-    def selection_as_token_indices(self, hidden_states: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    def selection_as_token_indices(self,
+                                   hidden_states: torch.Tensor,
+                                   freqs: torch.Tensor,
+                                   return_loss_inputs: bool = False):
         """Encode the selection as token indices for the sparse kernel.
 
         Returns:
@@ -293,16 +377,23 @@ class QSAIndexer(nn.Module):
             per-sample sequence space, matching ``qsa_sparse_attention``'s sbhd
             branch. Top-block tokens and the query's own partial-block tail are
             disjoint, so the kernel attends each selected key exactly once.
+            ``return_loss_inputs`` returns ``(indices, QSALossInputs)`` as in
+            ``selection_as_mask``.
 
         Same layout constraints as ``selection_as_mask`` (causal, unpacked).
         """
-        core = self._score_and_topk_blocks(hidden_states, freqs)
-        if core is None:
-            return None
-        top_blocks, keep, n_blocks = core
         s, b, _ = hidden_states.shape
+        projected = self._project_sbhd(hidden_states.detach(), freqs) if return_loss_inputs else None
+        with torch.no_grad():
+            core = self._score_and_topk_blocks(hidden_states, freqs, projected)
+            indices = None if core is None else self._encode_indices(core, s, b, hidden_states.device)
+        if return_loss_inputs:
+            return indices, self._sbhd_loss_inputs(projected, core, s, b)
+        return indices
+
+    def _encode_indices(self, core, s: int, b: int, device) -> torch.Tensor:
+        top_blocks, keep, n_blocks = core
         R = self.compress_ratio
-        device = hidden_states.device
         k = top_blocks.shape[-1]
         arange_r = torch.arange(R, device=device)
 
@@ -321,12 +412,65 @@ class QSAIndexer(nn.Module):
 
         return torch.cat([top_idx, tail_idx], dim=-1).to(torch.int64)
 
-    @torch.no_grad()
+    def _project_thd(self, hidden_tok: torch.Tensor, freqs: torch.Tensor, cu_seqlens: torch.Tensor):
+        """``[T, h]`` -> index queries ``[T, nh, d]`` and every document's complete-block keys ``[NB, d]``.
+
+        Blocks lie on each document's own grid; differentiable when called with grad.
+        """
+        T, _ = hidden_tok.shape
+        R = self.compress_ratio
+        device = hidden_tok.device
+        doc_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()  # [D]
+        D = doc_lens.numel()
+        full_blocks = doc_lens // R  # complete R-blocks per document
+
+        # ---- project to indexer q/k ----
+        qk = self.index_qk_proj(hidden_tok)[0]
+        q, token_k = torch.split(
+            qk, [self.index_n_heads * self.index_head_dim, self.index_kv_heads * self.index_head_dim], dim=-1)
+        q = q.view(T, self.index_n_heads, self.index_head_dim)
+        raw_keys = token_k.view(T, self.index_kv_heads, self.index_head_dim).squeeze(1)  # [T, d]
+        q = self.q_layernorm(q)
+
+        # ---- rope on q at its own (in-doc) position ----
+        # Deliberately not _materialize_rope: thd has no batch dim to preserve
+        # (samples are already flattened into T), so the trailing dims are folded
+        # into rot here instead of being kept separate.
+        mscale = self.config.attention_scaling
+        f = freqs.reshape(freqs.shape[0], -1)[:T]
+        cos = (torch.cos(f) * mscale).to(q.dtype)
+        sin = (torch.sin(f) * mscale).to(q.dtype)
+        q = _apply_partial_rope(q, cos.unsqueeze(1), sin.unsqueeze(1))  # [T, nh, d]
+
+        # ---- pool complete blocks in pack space (shared across queries) ----
+        # Gather each block's R tokens and mean them exactly like the sbhd path; an
+        # atomic index_add would let the pooled keys (and so near-tied top-k) differ
+        # between a forward and its recompute.
+        NB = int(full_blocks.sum().item())
+        block_offset = torch.cumsum(full_blocks, 0) - full_blocks  # exclusive [D]
+        block_doc = torch.repeat_interleave(torch.arange(D, device=device), full_blocks)  # [NB]
+        block_in_doc_idx = torch.arange(NB, device=device) - block_offset[block_doc]  # [NB]
+        first_pack = cu_seqlens[block_doc].long() + block_in_doc_idx * R  # [NB]
+        key_groups = raw_keys[first_pack.unsqueeze(-1) + torch.arange(R, device=device)]  # [NB, R, d]
+        pooled = key_groups.float().mean(dim=1).to(raw_keys.dtype)
+        pooled = self.k_layernorm(pooled)  # [NB, d]
+
+        # blocks rotate at their first token's in-doc position
+        block_keys = _apply_partial_rope(pooled, cos[first_pack], sin[first_pack])  # [NB, d]
+        return q, block_keys
+
+    def project_loss_inputs_thd(self, hidden_tok: torch.Tensor, freqs: torch.Tensor,
+                                cu_seqlens: torch.Tensor) -> QSALossInputs:
+        """Dense-support KL inputs for packed input; ``hidden_tok`` is detached."""
+        q, block_keys = self._project_thd(hidden_tok.detach(), freqs, cu_seqlens)
+        return QSALossInputs(q=q, block_keys=block_keys, cu_seqlens=cu_seqlens.long())
+
     def select_token_indices_thd(self,
                                  hidden_tok: torch.Tensor,
                                  freqs: torch.Tensor,
                                  cu_seqlens: torch.Tensor,
-                                 force_materialize: bool = False) -> torch.Tensor:
+                                 force_materialize: bool = False,
+                                 return_loss_inputs: bool = False):
         """QSA selection for packed (thd) inputs, indices in pack space.
 
         A standalone implementation: it does *not* call
@@ -341,6 +485,9 @@ class QSAIndexer(nn.Module):
                 under padding_free), so they are reused as-is here.
             cu_seqlens: ``[D+1]`` int document boundaries (``cu[0] == 0``,
                 ``cu[-1] == T``).
+            return_loss_inputs: also return ``QSALossInputs`` (see
+                ``selection_as_mask``); its support is ``None`` when the selection
+                is a no-op.
 
         Returns:
             ``[T, K]`` int64 pack-space indices (``K = block_topk*R + R``), ``-1``
@@ -360,73 +507,47 @@ class QSAIndexer(nn.Module):
         doc_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()  # [D]
         D = doc_lens.numel()
         full_blocks = doc_lens // R  # complete R-blocks per document
-        if not force_materialize and int(full_blocks.max().item()) <= self.block_topk:
-            return None
+        noop = int(full_blocks.max().item()) <= self.block_topk
+        loss_inputs = self.project_loss_inputs_thd(hidden_tok, freqs, cu_seqlens) if return_loss_inputs else None
+        if noop and not force_materialize:
+            return (None, loss_inputs) if return_loss_inputs else None
 
-        # ---- per-token document id / in-doc position ----
-        token_doc = torch.repeat_interleave(torch.arange(D, device=device), doc_lens)  # [T]
-        pos_in_doc = torch.arange(T, device=device) - cu_seqlens[token_doc].long()  # [T]
+        with torch.no_grad():
+            if loss_inputs is not None:
+                q, block_keys = loss_inputs.q, loss_inputs.block_keys
+            else:
+                q, block_keys = self._project_thd(hidden_tok, freqs, cu_seqlens)
 
-        # ---- project to indexer q/k ----
-        qk = self.index_qk_proj(hidden_tok)[0]
-        q, token_k = torch.split(
-            qk, [self.index_n_heads * self.index_head_dim, self.index_kv_heads * self.index_head_dim], dim=-1)
-        q = q.view(T, self.index_n_heads, self.index_head_dim)
-        raw_keys = token_k.view(T, self.index_kv_heads, self.index_head_dim).squeeze(1)  # [T, d]
-        q = self.q_layernorm(q)
+            # ---- per-token document id / in-doc position ----
+            token_doc = torch.repeat_interleave(torch.arange(D, device=device), doc_lens)  # [T]
+            pos_in_doc = torch.arange(T, device=device) - cu_seqlens[token_doc].long()  # [T]
+            NB = int(full_blocks.sum().item())
+            block_offset = torch.cumsum(full_blocks, 0) - full_blocks  # exclusive [D]
+            block_doc = torch.repeat_interleave(torch.arange(D, device=device), full_blocks)  # [NB]
+            block_in_doc_idx = torch.arange(NB, device=device) - block_offset[block_doc]  # [NB]
 
-        # ---- rope on q at its own (in-doc) position ----
-        # Deliberately not _materialize_rope: thd has no batch dim to preserve
-        # (samples are already flattened into T), so the trailing dims are folded
-        # into rot here instead of being kept separate.
-        mscale = self.config.attention_scaling
-        f = freqs.reshape(freqs.shape[0], -1)[:T]
-        cos = (torch.cos(f) * mscale).to(q.dtype)
-        sin = (torch.sin(f) * mscale).to(q.dtype)
-        rot = cos.shape[-1]
+            # ---- score only in-document blocks, chunked over queries ----
+            q_nblocks = (pos_in_doc + 1) // R  # [T]
+            top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk)
+            k = top_blocks.shape[1]
 
-        def apply_rope(t, cos_, sin_):
-            t_rope, t_pass = t[..., :rot], t[..., rot:]
-            t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
-            return torch.cat((t_rope, t_pass), dim=-1)
+            # ---- top-k blocks -> token indices ----
+            arange_r = torch.arange(R, device=device)
+            base = cu_seqlens[block_doc[top_blocks]].long() + block_in_doc_idx[top_blocks] * R  # [T, k]
+            top_idx = (base.unsqueeze(-1) + arange_r).flatten(-2)  # [T, k*R]
+            top_keep = keep.unsqueeze(-1).expand(-1, -1, R).reshape(T, k * R)
+            top_idx = torch.where(top_keep, top_idx, top_idx.new_full((), -1))
 
-        q = apply_rope(q, cos.unsqueeze(1), sin.unsqueeze(1))  # [T, nh, d]
+            # ---- tail: the query's own partial block, causally truncated ----
+            tail_base = cu_seqlens[token_doc].long() + q_nblocks * R  # [T]
+            tail_idx = tail_base.unsqueeze(-1) + arange_r[None, :]  # [T, R]
+            token_pos = torch.arange(T, device=device)
+            tail_idx = torch.where(tail_idx <= token_pos[:, None], tail_idx, tail_idx.new_full((), -1))
+            indices = torch.cat([top_idx, tail_idx], dim=-1).to(torch.int64)
 
-        # ---- pool complete blocks in pack space (shared across queries) ----
-        NB = int(full_blocks.sum().item())
-        token_in_full = pos_in_doc < (full_blocks * R)[token_doc]  # [T]
-        block_in_doc = pos_in_doc // R  # [T]
-        block_offset = torch.cumsum(full_blocks, 0) - full_blocks  # exclusive [D]
-        global_block = block_offset[token_doc] + block_in_doc  # [T]
-
-        pooled_sum = torch.zeros(NB, self.index_head_dim, device=device, dtype=torch.float32)
-        gb = global_block[token_in_full]
-        pooled_sum.index_add_(0, gb, raw_keys[token_in_full].float())
-        pooled = (pooled_sum / R).to(raw_keys.dtype)  # exactly R tokens per full block
-        pooled = self.k_layernorm(pooled)  # [NB, d]
-
-        # blocks rotate at their first token's in-doc position
-        block_doc = torch.repeat_interleave(torch.arange(D, device=device), full_blocks)  # [NB]
-        block_in_doc_idx = torch.arange(NB, device=device) - block_offset[block_doc]  # [NB]
-        first_pack = cu_seqlens[block_doc].long() + block_in_doc_idx * R  # [NB]
-        block_keys = apply_rope(pooled, cos[first_pack], sin[first_pack])  # [NB, d]
-
-        # ---- score only in-document blocks, chunked over queries ----
-        q_nblocks = (pos_in_doc + 1) // R  # [T]
-        top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk)
-        k = top_blocks.shape[1]
-
-        # ---- top-k blocks -> token indices ----
-        arange_r = torch.arange(R, device=device)
-        base = cu_seqlens[block_doc[top_blocks]].long() + block_in_doc_idx[top_blocks] * R  # [T, k]
-        top_idx = (base.unsqueeze(-1) + arange_r).flatten(-2)  # [T, k*R]
-        top_keep = keep.unsqueeze(-1).expand(-1, -1, R).reshape(T, k * R)
-        top_idx = torch.where(top_keep, top_idx, top_idx.new_full((), -1))
-
-        # ---- tail: the query's own partial block, causally truncated ----
-        tail_base = cu_seqlens[token_doc].long() + q_nblocks * R  # [T]
-        tail_idx = tail_base.unsqueeze(-1) + arange_r[None, :]  # [T, R]
-        token_pos = torch.arange(T, device=device)
-        tail_idx = torch.where(tail_idx <= token_pos[:, None], tail_idx, tail_idx.new_full((), -1))
-
-        return torch.cat([top_idx, tail_idx], dim=-1).to(torch.int64)
+        if not return_loss_inputs:
+            return indices
+        if not noop:
+            # A forced no-op selects every visible block, i.e. the dense support.
+            loss_inputs.top_blocks, loss_inputs.keep = top_blocks, keep
+        return indices, loss_inputs

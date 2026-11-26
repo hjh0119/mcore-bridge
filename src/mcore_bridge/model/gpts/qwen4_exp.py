@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import dataclasses
 import math
 import megatron.core
 import torch
@@ -7,6 +8,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from contextlib import contextmanager
 from copy import deepcopy
+from megatron.core import mpu
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -15,6 +17,8 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_parallel_region,
                                                     scatter_to_sequence_parallel_region)
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.dsa import (DSAIndexerLossAutoScaler,
+                                                                          DSAIndexerLossLoggingHelper)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import make_viewless_tensor
@@ -27,7 +31,8 @@ from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 
 from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, QSAIndexer, QSASparseCoreAttention,
                        Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock, TransformerLayer,
-                       qsa_sparse_supported, use_qsa_sparse_kernel)
+                       qsa_indexer_kl_loss, qsa_sparse_supported, use_qsa_sparse_kernel)
+from ..modules.kernels.qsa_kernels import _cp_query_global_positions, _cp_query_global_positions_thd
 from ..modules.ple import Qwen4ExpTextNGramEmbedding
 from ..mtp import MultiTokenPredictionLayer, get_mtp_capabilities
 from ..register import ModelLoader
@@ -68,17 +73,49 @@ class Qwen4ExpLayer(TransformerLayer):
                 config, config.ple_layer_ids.index(self.layer_number), pg_collection=self.pg_collection)
         is_linear_attention = self._resolve_is_linear_attention(config)
         if not is_linear_attention and config.indexer_n_heads is not None:
-            self.self_attention.indexer = QSAIndexer(config, tp_group=self.tp_group)
-            if qsa_sparse_supported(config.kv_channels):
+            indexer = QSAIndexer(config, tp_group=self.tp_group)
+            self.self_attention.indexer = indexer
+            kernel_enabled = qsa_sparse_supported(config.kv_channels)
+            # The indexer KL reads its teacher q/k from this wrapper, so install it
+            # even when the kernel itself is unavailable.
+            if kernel_enabled or indexer.loss_coeff > 0:
                 attn = self.self_attention
                 attn.core_attention = QSASparseCoreAttention(
-                    attn.core_attention, config, softmax_scale=config.softmax_scale)
+                    attn.core_attention, config, softmax_scale=config.softmax_scale, kernel_enabled=kernel_enabled)
         self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
         self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
 
     # override in MTP layer
     def _resolve_is_linear_attention(self, config):
         return config.linear_attention_freq[self.layer_number - 1]
+
+    def _qsa_indexer_loss_enabled(self) -> bool:
+        """Train the indexer on this forward: KL on, training, autograd live, indexer trainable.
+
+        Under full recompute the first (no-grad) forward skips the KL and the
+        recompute computes it once, as DSA does.
+        """
+        indexer = getattr(self.self_attention, 'indexer', None)
+        if indexer is None or indexer.loss_coeff <= 0 or not self.training or not torch.is_grad_enabled():
+            return False
+        if not any(p.requires_grad for p in indexer.parameters()):
+            logger.warning_once('dsa_indexer_loss_coeff > 0 but the QSA indexer parameters are frozen (e.g. by a '
+                                'tuner); the indexer KL is skipped. Make the indexer trainable to train it.')
+            return False
+        return True
+
+    @contextmanager
+    def _qsa_capture_qk(self, enabled: bool):
+        if not enabled:
+            yield None
+            return
+        core = self.self_attention.core_attention
+        captured = []
+        core.capture_qk = captured
+        try:
+            yield captured
+        finally:
+            core.capture_qk = None
 
     def forward(self, hidden_states: torch.Tensor, **kwargs):
         attention_mask = kwargs.get('attention_mask')
@@ -100,15 +137,21 @@ class Qwen4ExpLayer(TransformerLayer):
 
         # attention sub-block (mirrors transformers Qwen4ExpTextDecoderLayer.forward)
         hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
-        qsa_selection, sparse = self._qsa_select(hidden_states, attn_kwargs, kwargs.get('position_ids'))
+        loss_mode = self._qsa_indexer_loss_enabled()
+        qsa_selection, sparse, loss_inputs = self._qsa_select(
+            hidden_states, attn_kwargs, kwargs.get('position_ids'), loss_mode=loss_mode)
         if qsa_selection is not None:
             # sparse: int64 indices consumed by QSASparseCoreAttention; mask
             # fallback: bool mask consumed by TE under attn_mask_type=arbitrary.
             attn_kwargs = dict(attn_kwargs, attention_mask=qsa_selection)
         # `arbitrary` mask type is only needed for the bool-mask (TE) path; the
         # sparse kernel reads the indices and ignores attn_mask_type.
-        with self._patch_apply_rotary_pos_emb(), self._qsa_arbitrary_mask(qsa_selection is not None and not sparse):
-            hidden_states, _ = self.self_attention(hidden_states=hidden_states, **attn_kwargs)
+        bool_mask = qsa_selection is not None and not sparse
+        with self._patch_apply_rotary_pos_emb(), self._qsa_arbitrary_mask(bool_mask):
+            with self._qsa_capture_qk(loss_mode) as captured:
+                hidden_states, _ = self.self_attention(hidden_states=hidden_states, **attn_kwargs)
+        if loss_mode:
+            hidden_states = self._attach_qsa_indexer_loss(hidden_states, loss_inputs, captured, packed_seq_params)
         injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
         hidden_states = hyper_input + injection.flatten(-2)
 
@@ -147,81 +190,114 @@ class Qwen4ExpLayer(TransformerLayer):
             for t, old in saved:
                 t.attn_mask_type = old
 
-    def _qsa_select(self, hidden_states, attn_kwargs, position_ids=None):
+    def _qsa_select(self, hidden_states, attn_kwargs, position_ids=None, loss_mode=False):
         """Choose the QSA selection representation for this forward.
 
-        Returns ``(selection, is_sparse)``. ``is_sparse`` means ``selection`` is the
-        int64 index tensor consumed by ``QSASparseCoreAttention`` (sbhd and thd,
-        with or without SP/CP); otherwise it is the bool TE mask from the legacy
-        path, or ``None`` for full attention. CP needs the all_gather comm type
-        (the selection has to see every key before attention runs; ring/p2p
+        Returns ``(selection, is_sparse, loss_inputs)``. ``is_sparse`` means
+        ``selection`` is the int64 index tensor consumed by ``QSASparseCoreAttention``
+        (sbhd and thd, with or without SP/CP); otherwise it is the bool TE mask from
+        the legacy path, or ``None`` for full attention. CP needs the all_gather comm
+        type (the selection has to see every key before attention runs; ring/p2p
         cannot provide that), mirroring mcore DSA's restriction.
+
+        ``loss_inputs`` (``QSALossInputs``) is only built in ``loss_mode`` (indexer
+        KL training), from the same single projection that routes. Dense-support KL
+        (``dsa_indexer_use_sparse_loss=False``, the tech report's Stage-1
+        distillation) runs the main attention dense, so its teacher is the full
+        attention the indexer is distilled from.
         """
         indexer = getattr(self.self_attention, 'indexer', None)
-        sparse_ok = isinstance(getattr(self.self_attention, 'core_attention', None), QSASparseCoreAttention)
         if indexer is None:
-            return None, False
+            return None, False, None
+        core = getattr(self.self_attention, 'core_attention', None)
+        sparse_ok = isinstance(core, QSASparseCoreAttention) and core.kernel_enabled
         packed_seq_params: PackedSeqParams = attn_kwargs.get('packed_seq_params')
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         cp_size = self.config.context_parallel_size
         needs_kernel = is_thd or cp_size > 1
+        # Stage-1 distillation trains against full attention, so it runs dense on every
+        # training forward -- including the no-grad first pass of a full recompute, whose
+        # output must equal the recomputed one.
+        dense = indexer.loss_coeff > 0 and not indexer.use_sparse_loss and self.training
+        if dense and not loss_mode:
+            return None, False, None
 
-        # sbhd with CP==1
-        if not needs_kernel:
-            return self._qsa_select_mask(hidden_states, attn_kwargs), False
-
-        # From here the mask path is not an option, so by default a failure raises instead
-        # of silently degrading to dense attention (which would diverge from the sparse
-        # rollout without telling anyone). An explicit opt-out via the env var is the one
-        # sanctioned fallback: full attention, warned about once.
-        if not sparse_ok:
+        # Off the sbhd/CP==1 mask path the kernel is the only sparse option, so by default
+        # a failure raises instead of silently degrading to dense attention (which would
+        # diverge from the sparse rollout without telling anyone). An explicit opt-out via
+        # the env var is the one sanctioned fallback: full attention, warned about once.
+        if needs_kernel and not sparse_ok and not dense:
             if not use_qsa_sparse_kernel():
                 logger.warning_once(f'QSA sparse kernel is disabled via {QSA_SPARSE_KERNEL_ENV}=0; '
                                     f'falling back to full attention ({"packing/thd" if is_thd else f"CP={cp_size}"}).')
-                return None, False
-            raise RuntimeError(f'QSA needs the sparse kernel here ({"packing/thd" if is_thd else f"CP={cp_size}"}), '
-                               'but QSASparseCoreAttention was not installed -- triton is missing or '
-                               f'kv_channels={getattr(self.config, "kv_channels", None)} is not a power of two. '
-                               'Use --padding_free false with context_parallel_size 1 to take the bool-mask path, '
-                               f'or set {QSA_SPARSE_KERNEL_ENV}=0 to fall back to full attention.')
-        if cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'all_gather':
+                if not loss_mode:
+                    return None, False, None
+                # full attention is what runs, so the KL distills against it
+                dense = True
+            else:
+                raise RuntimeError(
+                    f'QSA needs the sparse kernel here ({"packing/thd" if is_thd else f"CP={cp_size}"}), '
+                    'but QSASparseCoreAttention was not installed -- triton is missing or '
+                    f'kv_channels={getattr(self.config, "kv_channels", None)} is not a power of two. '
+                    'Use --padding_free false with context_parallel_size 1 to take the bool-mask path, '
+                    f'or set {QSA_SPARSE_KERNEL_ENV}=0 to fall back to full attention.')
+        if needs_kernel and not dense and cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'all_gather':
             raise RuntimeError(f'QSA sparse selection with context_parallel_size={cp_size} requires '
                                f"cp_comm_type='all_gather' (got {getattr(self.config, 'cp_comm_type', None)!r}): the "
                                'selection has to see every key before attention runs, which ring/p2p cannot provide.')
         rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
         if rotary_pos_emb is None:
-            raise RuntimeError('QSA sparse selection needs rotary_pos_emb (blocks rotate at their first '
+            raise RuntimeError('QSA selection needs rotary_pos_emb (blocks rotate at their first '
                                'token position) but it was not passed to the layer.')
         if is_thd:
-            indices = self._qsa_select_indices_thd(hidden_states, rotary_pos_emb, packed_seq_params, position_ids)
+            hidden_tok, freqs, cu = self._qsa_thd_inputs(hidden_states, rotary_pos_emb, packed_seq_params, position_ids)
+            if dense:
+                return None, False, indexer.project_loss_inputs_thd(hidden_tok, freqs, cu)
+            out = indexer.select_token_indices_thd(
+                hidden_tok, freqs, cu, force_materialize=cp_size > 1, return_loss_inputs=loss_mode)
         else:
-            indices = self._qsa_select_indices_sbhd(hidden_states, rotary_pos_emb)
-        return indices, True
+            hidden_full, freqs = self._qsa_sbhd_inputs(hidden_states, rotary_pos_emb)
+            if dense:
+                return None, False, indexer.project_loss_inputs_sbhd(hidden_full, freqs)
+            if needs_kernel:
+                out = indexer.selection_as_token_indices(hidden_full, freqs, return_loss_inputs=loss_mode)
+            else:
+                # Bool-mask QSA on TE's `arbitrary` mask (sbhd with CP==1): TE rejects an
+                # arbitrary mask under thd, and this path never gathers keys across CP
+                # ranks. None means full attention, which only happens when the sequence
+                # is short enough that selection is a no-op anyway.
+                out = indexer.selection_as_mask(hidden_full, freqs, return_loss_inputs=loss_mode)
+        selection, loss_inputs = out if loss_mode else (out, None)
+        return selection, needs_kernel, loss_inputs
 
-    def _qsa_select_indices_sbhd(self, hidden_states, rotary_pos_emb):
+    def _qsa_sbhd_inputs(self, hidden_states, rotary_pos_emb):
+        """Full-sequence indexer input: undo SP and CP sharding (non-differentiable)."""
         if self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1:
             hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
         if self.config.context_parallel_size > 1:
             hidden_states = reconstruct_tensor_cp(hidden_states, None, dim=0)
             rotary_pos_emb = reconstruct_tensor_cp(rotary_pos_emb, None, dim=0)
-        return self.self_attention.indexer.selection_as_token_indices(hidden_states, rotary_pos_emb)
+        return hidden_states, rotary_pos_emb
 
-    def _qsa_select_indices_thd(self, hidden_states, rotary_pos_emb, packed_seq_params, position_ids=None):
+    @staticmethod
+    def _int32_packed_seq_params(packed_seq_params):
+        # TE's packed CP partition (thd_get_partitioned_indices) requires int32 cu;
+        # the training pipeline produces int32, but normalize callers that hand us int64.
+        if packed_seq_params.cu_seqlens_q is not None and packed_seq_params.cu_seqlens_q.dtype != torch.int32:
+            psp_for_cp = copy.copy(packed_seq_params)
+            psp_for_cp.cu_seqlens_q = packed_seq_params.cu_seqlens_q.to(torch.int32)
+            if packed_seq_params.cu_seqlens_q_padded is not None:
+                psp_for_cp.cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded.to(torch.int32)
+            return psp_for_cp
+        return packed_seq_params
+
+    def _qsa_thd_inputs(self, hidden_states, rotary_pos_emb, packed_seq_params, position_ids=None):
+        """Full-pack indexer input ``(hidden_tok [T, h], freqs, cu_seqlens)``, SP/CP undone."""
         if self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1:
             hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
         psp_for_cp = None
         if self.config.context_parallel_size > 1:
-            # TE's packed CP partition (thd_get_partitioned_indices) requires
-            # int32 cu; the training pipeline produces int32, but normalize callers
-            # that hand us int64.
-            if packed_seq_params.cu_seqlens_q is not None \
-                    and packed_seq_params.cu_seqlens_q.dtype != torch.int32:
-                psp_for_cp = copy.copy(packed_seq_params)
-                psp_for_cp.cu_seqlens_q = packed_seq_params.cu_seqlens_q.to(torch.int32)
-                if packed_seq_params.cu_seqlens_q_padded is not None:
-                    psp_for_cp.cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded.to(torch.int32)
-            else:
-                psp_for_cp = packed_seq_params
+            psp_for_cp = self._int32_packed_seq_params(packed_seq_params)
             local_len = hidden_states.shape[0]
             hidden_states = reconstruct_tensor_cp(hidden_states, psp_for_cp, dim=0)
         # Per-token rotary angles. Without rope fusion gpt_model already indexes
@@ -258,26 +334,84 @@ class Qwen4ExpLayer(TransformerLayer):
                                'boundaries, but it is missing.')
         cu = Qwen4ExpTextPLELayer._normalize_cu_seqlens(cu, hidden_states.shape[0])
         hidden_tok = hidden_states.reshape(hidden_states.shape[0], -1)
-        return self.self_attention.indexer.select_token_indices_thd(
-            hidden_tok, freqs, cu, force_materialize=self.config.context_parallel_size > 1)
+        return hidden_tok, freqs, cu
 
-    def _qsa_select_mask(self, hidden_states, attn_kwargs):
-        # Bool-mask QSA on TE's `arbitrary` mask. Only reached for sbhd with CP==1 --
-        # _qsa_selection() routes thd and CP>1 to the kernel, because TE rejects an
-        # arbitrary mask under thd and this path never gathers keys across CP ranks.
-        # Returning None means full attention, which here only happens when the
-        # sequence is short enough that selection is a no-op anyway (selection_as_mask
-        # short-circuits at max_blocks <= block_topk).
-        indexer = self.self_attention.indexer
-        if indexer is None:
+    @staticmethod
+    def _qsa_valid_rows(packed_seq_params, cu_padded):
+        """``[T]`` bool, False on each document's padding in a padded pack; ``None`` if unpadded."""
+        cu_real = getattr(packed_seq_params, 'cu_seqlens_q', None)
+        if getattr(packed_seq_params, 'cu_seqlens_q_padded', None) is None or cu_real is None:
             return None
-        rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
-        if rotary_pos_emb is None:
-            raise RuntimeError('QSA bool-mask selection needs rotary_pos_emb (blocks rotate at their first '
-                               'token position) but it was not passed to the layer.')
-        if self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1:
-            hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
-        return indexer.selection_as_mask(hidden_states, rotary_pos_emb)
+        cu_real = cu_real.reshape(-1).to(device=cu_padded.device, dtype=torch.long)
+        if int(cu_real[0]) != 0:  # the same leading-zero repair _normalize_cu_seqlens applies
+            cu_real = torch.cat([cu_real.new_zeros(1), cu_real])
+        if cu_real.numel() != cu_padded.numel():
+            raise ValueError(f'QSA indexer KL cannot pair cu_seqlens_q ({cu_real.numel()} entries) with '
+                             f'cu_seqlens_q_padded ({cu_padded.numel()} entries).')
+        real_lens = cu_real[1:] - cu_real[:-1]
+        padded_lens = cu_padded[1:] - cu_padded[:-1]
+        if torch.equal(real_lens, padded_lens):
+            return None
+        token_doc = torch.repeat_interleave(torch.arange(padded_lens.numel(), device=cu_padded.device), padded_lens)
+        pos = torch.arange(int(cu_padded[-1]), device=cu_padded.device) - cu_padded[token_doc]
+        return pos < real_lens[token_doc]
+
+    def _attach_qsa_indexer_loss(self, attn_out, loss_inputs, captured, packed_seq_params):
+        """Compute the indexer KL from the captured teacher q/k and hook it onto ``attn_out``.
+
+        The forward value is unchanged; in backward ``DSAIndexerLossAutoScaler`` feeds the
+        KL its main-loss scale (set through ``experimental_attention_variant_loss_scale_func``).
+        """
+        if not captured:
+            raise RuntimeError('QSA indexer KL captured no attention q/k: core_attention did not run through '
+                               'QSASparseCoreAttention on this forward.')
+        query, key = captured[-1]
+        config = self.config
+        cp_size = config.context_parallel_size
+        cp_rank = mpu.get_context_parallel_rank() if cp_size > 1 else 0
+        device = query.device
+        valid_rows = None
+        if query.dim() == 3:  # thd: [T_local, Hq, D]
+            cu = loss_inputs.cu_seqlens
+            rows = None
+            if cp_size > 1:
+                key = reconstruct_tensor_cp(key, self._int32_packed_seq_params(packed_seq_params), dim=0)
+                rows = _cp_query_global_positions_thd(cu, cp_size, cp_rank, device)
+            valid_rows = self._qsa_valid_rows(packed_seq_params, cu)
+        else:  # sbhd: [s_local, b, H, D], flattened batch-major like the indexer's pack space
+            sq, b = query.shape[0], query.shape[1]
+            if cp_size > 1:
+                key = reconstruct_tensor_cp(key, None, dim=0)
+                pos = _cp_query_global_positions(key.shape[0], cp_size, cp_rank, device)
+            else:
+                pos = torch.arange(sq, device=device)
+            s = key.shape[0]
+            key = key.transpose(0, 1).reshape(b * s, *key.shape[2:])
+            query = query.transpose(0, 1).reshape(b * sq, *query.shape[2:])
+            rows = (torch.arange(b, device=device).view(b, 1) * s + pos.view(1, -1)).reshape(-1)
+        core = self.self_attention.core_attention
+        softmax_scale = core.softmax_scale if core.softmax_scale is not None else query.shape[-1]**-0.5
+        indexer = self.self_attention.indexer
+        loss = qsa_indexer_kl_loss(
+            loss_inputs,
+            query,
+            key,
+            softmax_scale=softmax_scale,
+            compress_ratio=indexer.compress_ratio,
+            loss_coeff=indexer.loss_coeff,
+            query_rows=rows,
+            valid_rows=valid_rows,
+            tp_group=self.tp_group if config.tensor_model_parallel_size > 1 else None,
+            calculate_per_token_loss=config.calculate_per_token_loss)
+        # Same reduction groups as mcore DSA: each CP rank holds its own rows.
+        cp_group = mpu.get_context_parallel_group() if cp_size > 1 else None
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=loss,
+            layer_number=self.layer_number,
+            num_layers=config.num_layers,
+            reduce_group=cp_group if config.calculate_per_token_loss else None,
+            avg_group=None if config.calculate_per_token_loss else cp_group)
+        return DSAIndexerLossAutoScaler.apply(attn_out, loss)
 
 
 class Qwen4ExpTransformerBlock(TransformerBlock):
@@ -727,6 +861,15 @@ class Qwen4ExpLoader(ModelLoader):
     def _build_decoder_layer_specs(self):
         config = self.config
         config.hetereogenous_dist_checkpoint = True
+        if (config.dsa_indexer_loss_coeff or 0.0) > 0:
+            # qwen4_exp is not an mcore 'dsa' variant, so the schedule only scales the
+            # indexer KL by the main-loss scale (loss scale / microbatches / CP) through
+            # this hook; without it the KL gradient is num_microbatches times too large.
+            if 'experimental_attention_variant_loss_scale_func' not in {f.name for f in dataclasses.fields(config)}:
+                raise NotImplementedError('Qwen4-Exp QSA indexer KL training (dsa_indexer_loss_coeff > 0) needs '
+                                          'TransformerConfig.experimental_attention_variant_loss_scale_func '
+                                          f'(megatron-core >= 0.20), got {megatron.core.__version__}.')
+            config.experimental_attention_variant_loss_scale_func = DSAIndexerLossAutoScaler.set_loss_scale
         if config.context_parallel_size > 1 and getattr(config, 'cp_comm_type', None) in (None, 'p2p'):
             logger.warning_once(
                 "Qwen4-Exp QSA under context parallelism requires cp_comm_type='all_gather'; "

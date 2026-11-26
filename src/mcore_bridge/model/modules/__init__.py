@@ -11,7 +11,8 @@ from .hyper_connection_gated import Qwen4ExpTextGatedResidual, Qwen4ExpTextGroup
 from .kernels import QSA_SPARSE_KERNEL_ENV, QSASparseCoreAttention, qsa_sparse_supported, use_qsa_sparse_kernel
 from .multi_latent_attention import MLASelfAttention
 from .ple import Qwen4ExpTextNGramEmbedding, Qwen4ExpTextPLELayer
-from .qsa_indexer import QSAIndexer
+from .qsa_indexer import QSAIndexer, QSALossInputs
+from .qsa_indexer_loss import qsa_indexer_kl_loss
 from .topk_router import TopKRouter
 from .transformer_block import TransformerBlock
 from .transformer_layer import TransformerLayer
